@@ -907,3 +907,321 @@ baseline. `pnpm check`: **9 test files, 124 tests passing**, `tsc --noEmit`
 clean, `vite build` succeeds. As before, `spec/audio.test.ts`'s fake
 `AudioContext` graph verifies node-level scheduling correctness only — actual
 click-free/timbre/balance perception still needs a human listening pass.
+
+## Part B: giving Brass and Strings genuinely distinct synthetic identities
+
+The single-oscillator-plus-filter design (a lone sawtooth per voice, Brass and
+Strings differing only in filter cutoff/Q and vibrato depth) was rejected
+outright as "a darker version of the same oscillator" — the brief asks for
+audibly distinct ensembles, and a shared waveform with a lower cutoff cannot
+produce that regardless of how the filter is tuned. `audio.ts` was reworked
+around a small per-voice oscillator layer stack (`OscillatorLayer[]`, a "core"
+fundamental plus one or two "color" layers, gains chosen to sum to ~1.0 per
+preset so neither ensemble reads louder purely from having more layers), with
+the actual differences deliberately spread across several independent axes
+rather than one knob:
+
+1. **Different waveform combinations, not the same waveform darkened.** Brass
+   is a sawtooth core with a detuned square color layer and a second detuned
+   sawtooth (`BRASS_PRESET`) — the square layer is what gives the "brassy"
+   edge a low-pass filter alone cannot produce. Strings is a triangle core
+   with two detuned sawtooth color layers (`STRINGS_PRESET`) — a rounder
+   fundamental, closer to a bowed tone's spectrum, with the saws adding body
+   rather than edge.
+2. **Brass gets an attack transient and a pitch "scoop"; Strings does not.**
+   `scoopCents`/`scoopSeconds` starts each Brass layer flat and settles it up
+   to steady pitch over ~45ms (a breath-driven attack instability); a
+   `transientSeconds`/`transientPeakMultiplierByVoice` pair briefly opens the
+   filter above its steady-state cutoff at note-on before settling — a
+   breath "bite." Both are absent from `STRINGS_PRESET` entirely (no
+   `scoopCents`/`transientSeconds` keys).
+3. **Strings gets a filtered bow-noise burst; Brass does not.** A shared
+   noise buffer (`getNoiseBuffer`, generated once) is band-limited around each
+   note's own pitch (bandpass at `midi frequency * 3`) and enveloped to a low
+   peak gain (`noiseAmount = 0.05`, further scaled per voice via
+   `noiseByVoice`) for roughly the attack's duration, then gone — meant to
+   read as bow friction texture, not broadband hiss. `playBowNoiseBurst` is a
+   no-op whenever `preset.noiseAmount` is unset, i.e. always for Brass.
+4. **Vibrato onset differs, not just depth.** Brass vibrato is present at
+   full requested depth from the first sample (`vibratoOnsetSeconds: 0`);
+   Strings fades vibrato in from 0 over 0.4s (`vibratoOnsetSeconds: 0.4`) via
+   a dedicated `vibratoOnsetGain` node chained after the existing
+   `vibratoScaleGain` — a bowed note settles into vibrato rather than
+   starting with it, on top of Strings already having a larger max-depth
+   table (±16/14/11/6 cents vs Brass's ±7/6/5/3).
+5. **Movement-linked filter brightness is asymmetric.** Both presets already
+   brighten their filter cutoff with rising speed/level in `setExpression`
+   (unchanged mechanism), but `filterBrightnessRange` is 0.35 for Brass and
+   only 0.08 for Strings — a breath-driven instrument's tone color should
+   track how hard it's "blown" far more than a bowed section's does with bow
+   speed.
+6. **Different attack shape and release length.** `Preset.attackScale`
+   multiplies whichever base attack duration the caller passes: Brass stays
+   at 1 (the unscaled baseline the pre-existing attack-timing tests were
+   written against), Strings is 1.6 (a slower bow-swell). Release duration
+   and time constant are also no longer one shared constant — Strings' are
+   1.5× Brass's (`STRINGS_RELEASE_SECONDS`/`STRINGS_RELEASE_TIME_CONSTANT_SECONDS`),
+   since a bowed ensemble settles more slowly than articulate brass; this
+   required threading `releaseSeconds`/`releaseTimeConstantSeconds` onto each
+   `ActiveVoice` instead of the two release constants living only at module
+   scope.
+7. **A shared, mild waveshaper curve gives each preset a different amount of
+   soft-clip "edge"**, not distortion: `makeSaturationCurve(amount)`
+   interpolates between a pure linear pass-through (`amount=0`) and a
+   normalized `tanh` curve (`amount=1`). Brass uses `0.22` (audible warmth/
+   edge), Strings a much smaller `0.05` (just enough to avoid reading as a
+   perfectly clean synth tone).
+8. **Loudness matching is a design-level choice, not a listening-verified
+   one.** Per-voice `VOICE_RELATIVE_GAIN` and `MASTER_GAIN` are unchanged and
+   shared by both presets; each preset's oscillator-layer gains were chosen
+   to sum to roughly the same total energy (~1.0) into the same filter/
+   envelope chain so neither preset should read as structurally louder. This
+   is a mechanism-level design decision, explicitly **not** a claim that the
+   two ensembles have been confirmed to match in perceived loudness by ear —
+   see the honesty note below.
+
+**New tests** (`spec/audio.test.ts`) assert, against the fake `AudioContext`,
+that: Brass creates 3 oscillators per voice with the documented waveform
+types, Strings' core layer is `"triangle"` (not the same sawtooth as Brass),
+a Brass voice's oscillator detune is scheduled away from its steady value at
+onset (the scoop) while a Strings voice's is not, a Strings voice's vibrato
+gain ramps in from 0 while a Brass voice's is already at full depth from the
+first sample, a Strings note creates a `BufferSource` (the noise burst) while
+a Brass note does not, and Strings' filter-brightness response to a level
+change is smaller in magnitude than Brass's for the same level delta.
+
+### Honest verification status for Part B
+
+- `pnpm check` is green (see the current test count below — Part B's tests
+  are additive to the totals reported in this document's later sections).
+- **Structurally verified**: every one of the eight differences above exists
+  in the actual audio-graph wiring and scheduling, confirmed by reading
+  `audio.ts` and by dedicated tests against the fake `AudioContext` — this is
+  evidence the *mechanism* is genuinely different between presets, not that
+  the same preset is reused with a relabelled name.
+- **Not verified, and not claimed as verified: how any of this actually
+  sounds.** This environment has no speakers, no way to play audio, and no
+  way to judge timbre, perceived loudness, or "does Strings sound like
+  strings" by ear. Every claim above is about the *audio graph's structure*
+  (which node types exist, what values are scheduled, in what order), not
+  about the subjective listening experience. A human listening pass — on
+  real hardware, ideally more than one device — is required before Part B can
+  be reported as actually achieving "audibly distinct" or "matched loudness"
+  rather than "structurally distinct by design."
+
+## Part A: a real four-stave SVG conductor's score
+
+The transient fading-dot `visualization.ts` was deleted outright and replaced
+with `score.ts`'s `ScoreRenderer`, which builds and updates four real
+five-line SVG staves from the same `ChordEvent` that drives `audio.ts` —
+notation is a second consumer of the existing pipeline, not a parallel
+implementation that could drift out of sync with what's actually sounding.
+
+- **Clef selection is per-voice, per-ensemble, computed, not hardcoded per
+  staff.** Soprano and tenor keep the same clef (treble, bass) in both
+  ensembles; alto reads treble for Horn and alto clef for Viola — `score.ts`
+  picks the clef from `(voice, ensemble)` and `notation.ts`'s
+  `pitchToStaffPosition(pitchName, clef)` derives the note's line/space from
+  that clef's own bottom-line reference note, so the same sounded pitch (Horn
+  and Viola both play the identical F4 in the reference G7 chord) lands at
+  the geometrically correct position for whichever clef is showing, rather
+  than the renderer assuming alto and treble share a layout.
+- **Exactly one notehead per voice, concert pitch only, only the current
+  chord shown** — `showChord` clears and redraws the four staves' note
+  content from `event.notes` on every call; there's no persisted history and
+  no transposition step, matching the brief's "current chord only, concert
+  pitch" requirement directly rather than as an afterthought.
+- **Ledger lines and accidentals come from the same computed geometry as
+  everything else** — `pitchToStaffPosition`'s `ledgerLines`/`accidental`
+  fields are rendered as-is; a chord voiced with a pitch below/above the
+  staff, or with a sharp/flat, needs no special-casing in `score.ts` itself.
+- **Ensemble-specific instrument labels update immediately on switch** — the
+  four staff groups' `text.instrument-label` elements are rewritten from
+  `voicing.ts`'s per-voice instrument name every time `showChord` runs,
+  including from a bare ensemble switch via `retimbreChord`/`selectEnsemble`.
+
+`spec/score.test.ts` was added specifically because `spec/notation.test.ts`
+only exercises the pure `pitchToStaffPosition` geometry function in
+isolation — it cannot catch a regression in the *wiring* between `score.ts`
+and `notation.ts` (e.g. the wrong voice's label updated, the wrong clef
+picked for an ensemble, a rendered position that doesn't match the pitch
+actually in the `ChordEvent`). The new suite instead drives the real
+`ScoreRenderer` with real `ChordEvent`s and reads the resulting SVG DOM:
+
+- The reference G7 chord renders at the exact staff positions/clefs the
+  brief specifies for both ensembles (Trumpet/Violin B4, Horn F4 read on
+  treble, Viola's identical F4 read on alto at the geometrically correct
+  alto-clef position, Trombone/Cello D3, Tuba/Double Bass G2) — read from the
+  DOM's own staff-line `y` coordinates, not hand-computed pixel constants, so
+  a future change to staff spacing can't silently desync the test from the
+  renderer.
+- Ledger-line count matches `pitchToStaffPosition`'s own computed count for
+  both an in-staff chord (zero ledger lines) and a chord voiced below the
+  staff (`C`'s Tuba `C2`, two ledger lines).
+- Accidentals: a flatted voice shows the flat glyph, a natural voice shows
+  none, a sharped voice shows the sharp glyph.
+- Instrument labels are exactly `TRUMPET`/`HORN`/`TROMBONE`/`TUBA` for Brass
+  and `VIOLIN`/`VIOLA`/`CELLO`/`DOUBLE BASS` for Strings, and update
+  immediately on `showChord` with the other ensemble.
+- A sweep across four chord/ensemble combinations asserts every rendered
+  voice's ledger-line count and accidental class matches what
+  `pitchToStaffPosition` independently computes for that voice's *sounded*
+  pitch — the displayed/sounded-pitch-consistency requirement, checked
+  exhaustively rather than for the one worked reference example only.
+
+One jsdom-specific quirk was worked around in the test file, not in
+`score.ts`: `.accidental > *` reliably returns `null` under jsdom's SVG
+child-combinator handling even when the child element demonstrably exists
+(confirmed by walking to `.firstElementChild` directly instead) — this is a
+test-harness limitation, not a renderer bug, and is called out in the test
+file's own comment so it isn't mistaken for one later.
+
+`pnpm check` is green with `spec/score.test.ts` added; see the current test
+count in the verification section below.
+
+## Part C: real-browser responsive and interaction verification
+
+Static/jsdom tests cannot see a real layout, a real paint pipeline, or real
+pointer/touch geometry — this section covers driving the actual built page in
+headless Chrome via raw CDP (`Runtime.evaluate`, `Input.dispatchMouseEvent`,
+`Emulation.setDeviceMetricsOverride`, `Page.captureScreenshot`) at the three
+required viewport classes (Mac desktop ~1440×900, Windows desktop 1920×1080,
+narrow mobile 375×812 with touch emulation and a 2x device scale factor), and
+two genuine bugs this process found that no unit test could have caught.
+
+### Methodology
+
+A small Node script (no new project dependency — CDP's HTTP/WebSocket
+protocol is reachable directly with Node's built-in `fetch`/`WebSocket`)
+opens a fresh page at each target viewport, dispatches a synthetic but
+realistic conducting gesture (`mousePressed` → several `mouseMoved` samples
+forming a genuine corner per `gesture.ts`'s stable-segment model → a pause →
+`mouseReleased`), then reads back: `document.documentElement.scrollWidth`
+vs. `window.innerWidth` (any excess is real page-level horizontal overflow),
+every element whose bounding rect extends past the viewport, the baton's
+computed transform/position, the rendered clef/label/notehead DOM, and the
+`#status`/`#invitation` live-region text — plus a full-page screenshot for
+visual inspection. The built `dist/` output is served with a plain
+`python3 -m http.server`, not the dev server, so what's verified is the
+actual production bundle.
+
+### Bug found: page-level horizontal overflow from the baton's un-rotated layout box
+
+At 375×812 only, `scrollWidth` (409) exceeded `innerWidth` (375) by 34px —
+Mac and Windows desktop sizes showed no overflow. The baton (`#baton`,
+`position: absolute` inside `.score`, `position: relative`) is visually
+rotated/translated purely via CSS custom properties
+(`--baton-x`/`--baton-y`/`--baton-angle`), but its *layout* box is the
+un-rotated `210×40px` `.baton-svg` — `interaction.ts`'s `moveBatonTo` does
+not clamp the tracked pointer position to the surface's bounds, so near the
+right edge of a narrow surface that 210px-wide un-rotated box extends past
+`.score`'s own right edge. `.score` had no `overflow` set, and nothing
+between it and the document root clipped either, so the box's overhang
+inflated the *page's* own `scrollWidth`.
+
+**Fix**: added `overflow: hidden` to `.score` in `styles.css` — one line.
+This clips the baton to the visual container it's meant to render within
+without touching `interaction.ts`'s tracking/rotation math at all (clamping
+the tracked position was considered and rejected: it would make the baton
+visually stop short of the true pointer position near an edge, which is a
+worse user-facing behaviour than clipping an already-off-screen sliver of
+its layout box).
+
+**Verification**: re-ran the CDP script at all three viewports. `scrollWidth`,
+`window.innerWidth`, and `document.body.scrollWidth` are now exactly equal
+to the emulated device width at all three sizes (375, 1440, 1920) — zero
+overflow, confirmed by both the numeric report and visual screenshot
+inspection at multiple baton positions including deliberately near the
+narrow viewport's right edge.
+
+### Bug found: the baton's shaft never renders at all, in any real browser
+
+While screenshot-inspecting the fix above, the baton appeared on screen as
+two disconnected floating shapes — a dark handle and a gold tip/glow — with
+no connecting shaft between them, at every viewport and every baton
+position. This is a completely different, previously-undiscovered defect
+from the overflow bug, and directly undermines the brief's explicit "ivory/
+pale-wood shaft, darker handle, gold highlight" requirement (Part A.5) — the
+shaft is supposed to be the ivory-to-gold gradient piece connecting the two.
+
+**Diagnosis**: `pip3 install --quiet --user pillow` gave pixel-level access
+to the screenshots (no `convert`/`magick` available on this machine).
+Sampling pixels directly along the shaft's expected on-screen path returned
+the exact paper background color, not a low-contrast version of the
+gradient — i.e. genuinely unpainted, not merely hard to see. Reading the
+live `<line class="baton-shaft">` element's `getBBox()` in the browser
+returned `{ width: 145, height: 0 }` — a perfectly horizontal line has a
+zero-height bounding box. Its `stroke="url(#baton-shaft-gradient)"`
+referenced a `<linearGradient>` using the SVG default
+`gradientUnits="objectBoundingBox"`. Per the SVG spec, a paint server using
+object-bounding-box coordinates on a shape with a degenerate (zero-area)
+bounding box does not render at all — silently, with no console warning.
+This is invisible to every jsdom-based test in this project (jsdom has no
+real paint pipeline to catch it) and was only discoverable via a real
+browser's actual rendering.
+
+**Fix**: changed `#baton-shaft-gradient` in `index.html` from the default
+fractional `objectBoundingBox` coordinates to
+`gradientUnits="userSpaceOnUse" x1="20" y1="20" x2="165" y2="20"` — matching
+the shaft line's own actual endpoint coordinates, which bypasses the
+bounding-box-relative coordinate system that fails on this shape entirely.
+The handle's separate gradient (applied to a `<rect>` with real width *and*
+height, so a non-degenerate bounding box) was unaffected and left unchanged.
+
+**Verification**: re-inspected `getBBox()` and the live gradient's
+`outerHTML` after the fix, and re-captured clipped screenshots at several
+baton positions (including near the narrow viewport's right edge). The baton
+now renders as one visually coherent shape — dark handle, ivory-to-gold
+gradient shaft, gold tip and pulsing glow — matching the brief's description,
+where before it was silently two disconnected pieces in every browser this
+project has ever been checked in.
+
+### Full three-viewport verification after both fixes
+
+Re-ran `pnpm check` (green: 10 test files, 140 tests, `tsc --noEmit` clean,
+`vite build` succeeds) and the full CDP gesture-driven script at 1440×900,
+1920×1080, and 375×812 (with touch emulation and 2x device scale factor).
+At every size: zero page-level horizontal overflow; the correct staff/clef/
+label/notehead content renders for the reference chord; the baton follows
+the synthetic pointer trace, rotates to reflect its movement direction, and
+renders as one connected shape; the invitation text and `aria-live` status
+region behave correctly through the gesture lifecycle; the score's SVG
+scales via `preserveAspectRatio` without overflowing its container at any of
+the three widths.
+
+### Genuine touch-event verification (closing the gap above)
+
+The three-viewport pass above used `Input.dispatchMouseEvent` everywhere,
+including at the 375px width — mouse events, not touch events, even though
+Pointer Events are supposed to unify the two. Since the brief specifically
+says "the baton follows touch," that claim needed its own evidence rather
+than an assumption that mouse emulation covers it.
+
+A second CDP script drove the mobile viewport (375×812, 2x device scale,
+`Emulation.setTouchEmulationEnabled`) with a real `Input.dispatchTouchEvent`
+sequence — `touchStart`, six `touchMove` samples moving right, six more
+moving down (tracing a corner), then `touchEnd` — and read back the baton's
+CSS custom properties mid-gesture and the page's scroll width before/after
+release. Result: `--baton-x`/`--baton-y` tracked the touch trace, `--baton-
+angle` showed the expected ~90° turn at the corner, the invitation text
+hid on touch start, and `document.documentElement.scrollWidth` stayed
+exactly equal to `window.innerWidth` (375) both mid-gesture and after
+`touchEnd` — no overflow introduced by real touch input either. This
+directly exercises Part C.13's "baton follows touch" wording with actual
+touch events, not an inference from mouse-event behaviour.
+
+### What Part C has *not* yet verified, disclosed honestly
+
+- **Real hardware.** Everything above runs against headless Chrome via CDP
+  on this machine, not an actual Mac Safari session, a physical Windows
+  machine, or a physical phone. It is real-browser-pipeline verification
+  (real layout, real paint, real SVG rendering), which is why it caught two
+  bugs no unit test could — but it is not a substitute for the human
+  cross-device retest this project's audio-tuning history (see the
+  "Cross-device retest" section above) has repeatedly shown to surface
+  issues invisible from a single machine.
+- **No manual audio listening has been performed at any point in this
+  project's Part A/B/C work** (this environment has no speakers and no way
+  to play audio) — see Part B's honesty note above. This is stated plainly
+  here rather than implied, since Part C's browser-based visual verification
+  could otherwise be mistaken for having covered the audio requirements too.

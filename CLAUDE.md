@@ -111,8 +111,10 @@ here and wire it into `check`. Growing this file is the work.
   single `ChordEvent` record, no duration field — a sustained chord has no
   fixed length) → `audio.ts` (`AudioEngine`: sustained oscillator voices with
   pointer-lifecycle start/change/release, not timed one-shots) and
-  `notation.ts` (pure pitch-to-staff-position geometry; the SVG score
-  renderer itself is the next piece to land) both driven from the same
+  `notation.ts` (pure pitch-to-staff-position geometry) + `score.ts`
+  (`ScoreRenderer`: builds/updates four real SVG staves — clefs, labels,
+  noteheads, accidentals, ledger lines — from a `ChordEvent`, replacing the
+  old fading-dot `visualization.ts`) both driven from the same
   `ChordEvent`. `gesture.ts` (`GestureAnalyzer`) is a pure, DOM-free module
   that turns a raw pointer trace into `{ speed, chordChangeTriggered,
   vibratoIntensity }` per sample — stable-segment corner detection (a
@@ -344,9 +346,37 @@ here and wire it into `check`. Growing this file is the work.
   `pitchToStaffPosition(pitchName, clef)` derives a note's staff line/space
   from `diatonicStep` relative to each clef's bottom-line reference note —
   verified against the reference SVG's exact G7 layout and standard
-  ledger-line conventions in `spec/notation.test.ts`. The SVG score renderer
-  that consumes this (replacing the old fading-dot `visualization.ts`) has
-  not been built yet.
+  ledger-line conventions in `spec/notation.test.ts`. `score.ts`'s
+  `ScoreRenderer` consumes this to build/update four real five-line SVG
+  staves (Trumpet/Violin treble, Horn treble/Viola alto, Trombone/Cello bass,
+  Tuba/Double Bass bass), one notehead per voice, concert pitch only —
+  `spec/score.test.ts` drives the actual renderer (not just the pure geometry
+  function) with real `ChordEvent`s and reads the resulting SVG DOM, so a
+  wiring regression between `score.ts` and `notation.ts` fails there even
+  when `notation.test.ts` alone would still pass.
+- **An SVG gradient with the default `gradientUnits="objectBoundingBox"`
+  silently fails to paint on a shape with a degenerate (zero-width or
+  zero-height) bounding box** — a perfectly horizontal or vertical `<line>`
+  is exactly this case. No console warning, no error, and jsdom-based tests
+  can't catch it (there's no real paint pipeline) — this only surfaced via a
+  real-browser screenshot, where the conductor's baton's shaft rendered as
+  completely invisible despite correct markup and Web Animations-driven
+  transforms. Fix: give the gradient explicit `gradientUnits="userSpaceOnUse"`
+  with coordinates matching the shape's actual endpoints, bypassing the
+  bounding-box-relative coordinate system. Any future SVG gradient applied to
+  a `<line>` (as opposed to a shape with real width/height) needs this.
+- **An absolutely-positioned overlay that follows the pointer needs
+  `overflow: hidden` on its containing block**, not just careful transform
+  math. The conductor's baton (`#baton`, `position: absolute` inside `.score`,
+  `position: relative`) has a real, un-rotated layout box even though its
+  *visual* content is rotated/translated via CSS custom properties — near an
+  edge of the surface, that layout box can extend past `.score`'s own bounds
+  without being clipped by anything, which inflates the *page's* own
+  `scrollWidth` and produces real horizontal overflow on a narrow viewport.
+  This was invisible in every desktop-sized check and only appeared once a
+  375px-wide viewport was actually driven with pointer events at
+  `interaction.ts`'s reported edge coordinates — `.score { overflow: hidden }`
+  is the fix, not clamping the baton's tracked position in `interaction.ts`.
 - **Symphonic Strings preset exists in `audio.ts` and is reachable via the two
   explicit Brass 🎺 / Strings 🎻 buttons in `index.html` (or `1`/`2`), but is
   untested by ear.** Brass Choir is the only ensemble that has been listened
