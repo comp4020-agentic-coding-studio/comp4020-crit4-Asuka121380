@@ -104,37 +104,78 @@ here and wire it into `check`. Growing this file is the work.
 
 ## The Living Score (Crit 4 instrument)
 
-- **Architecture**: `harmony.ts` (Markov transition + chord-colour sampling,
-  seeded via `rng.ts`'s `mulberry32`) → `voicing.ts` (fixed four-part voicing
-  table, pitch-name-to-MIDI, per-ensemble instrument names) → `chordEvent.ts`
-  (the single `ChordEvent` record) → `audio.ts` (`AudioEngine`: oscillator +
-  biquad-lowpass filter + gain per voice, routed through one master gain) and
-  `visualization.ts` (`ChordVisualizer`: chord symbol + four fading gold note
-  markers) both driven from the same `ChordEvent`. `interaction.ts`
-  (`ConductingController`) turns pointer/touch/keyboard input into
-  `onChordTrigger` calls via accumulated-distance threshold crossing.
+- **Architecture (post gesture/audio refinement)**: `harmony.ts` (Markov
+  transition + chord-colour sampling, seeded via `rng.ts`'s `mulberry32`) →
+  `voicing.ts` (fixed four-part voicing table, pitch-name-to-MIDI,
+  `diatonicStep`/`parsePitchName` shared by notation) → `chordEvent.ts` (the
+  single `ChordEvent` record, no duration field — a sustained chord has no
+  fixed length) → `audio.ts` (`AudioEngine`: sustained oscillator voices with
+  pointer-lifecycle start/change/release, not timed one-shots) and
+  `notation.ts` (pure pitch-to-staff-position geometry; the SVG score
+  renderer itself is the next piece to land) both driven from the same
+  `ChordEvent`. `gesture.ts` (`GestureAnalyzer`) is a pure, DOM-free module
+  that turns a raw pointer trace into `{ speed, chordChangeTriggered,
+  vibratoIntensity }` per sample — axis-based corner detection instead of
+  accumulated-distance triggering, same-axis reversal drives vibrato instead
+  of retriggering a chord. `interaction.ts` (`ConductingController`) wires
+  pointer lifecycle (down starts sustain, move feeds `gesture.ts` and reports
+  baton position/rotation, up releases) plus `1`/`2` keydown shortcuts for
+  ensemble selection — this is what keeps the crit-4 "more than one input
+  modality" contract satisfied now that Space/arrow-key conducting is gone.
   `main.ts` wires it all to the DOM.
-- **Polyphony cap is 16 active single-note voices** (`MAX_ACTIVE_VOICES` in
-  `audio.ts`) — four per chord, room for a few overlapping chords during fast
-  conducting before the oldest voice is stolen (faded over 30ms, then
-  stopped) rather than letting the graph grow unbounded. Stolen voices are
-  removed from the bookkeeping pool immediately (not left waiting for the
-  browser's `ended` event), or rapid conducting can still exceed the cap
-  before cleanup catches up.
-- **Master gain is clamped to 0.2**, peak per-voice gain 0.22 — chosen and
-  checked on this machine's laptop speakers/headphones only. **A real-phone
-  listening pass has not yet been done** — do not treat this level as
-  confirmed safe until that happens (see `PROCESS.md`/`reflections/crit-4.md`
-  for current verification status).
-- **Keyboard conducting simulates movement on a steady 60ms tick** while
-  Space is held (`interaction.ts`'s `startKeyboardConducting`), feeding the
-  same distance-accumulation/threshold path as pointer movement, rather than
-  triggering on its own separate timer. Arrow keys move the baton indicator
-  only; they never trigger a chord.
-- **Distance threshold is 55px** (`DISTANCE_THRESHOLD_PX`) before one chord
-  triggers and the accumulator resets.
+- **Polyphony cap is 8 active voices** (`MAX_ACTIVE_VOICES` in `audio.ts`) —
+  four for the currently-sustaining chord, four more for the previous chord
+  while a crossfade is still in flight. A confirmed corner always steals any
+  leftover crossfade-out generation immediately (same "remove from the
+  bookkeeping array the instant it's stolen, don't wait for `ended`" pattern
+  proven in the MVP build) rather than letting a third generation
+  accumulate — see `spec/audio.test.ts`'s "keeps at most one crossfading-out
+  generation alive" test.
+- **Chord lifecycle is pointer-driven, not timed**: `AudioEngine.startChord`
+  (pointer-down, quick attack), `.changeChord` (confirmed corner, ~130ms
+  crossfade between outgoing and incoming chords), `.releaseChord`
+  (pointer-up, ~300ms release). `.setExpression(level, vibratoIntensity)` is
+  called on every pointer move and only ever touches the *currently
+  sustaining* chord's voices — a chord already fading out keeps its own
+  envelope undisturbed.
+- **Speed-to-volume mapping lives in `audio.ts`'s `speedToLevel`** (a pure,
+  directly-tested function): below `SPEED_FLOOR_PX_S` the level is a held
+  minimum (never silent while holding still), above `SPEED_CEILING_PX_S` it's
+  full volume, linear in between. Gain changes are applied via
+  `linearRampToValueAtTime` ~60ms out to avoid zipper noise.
+- **Vibrato is one shared LFO oscillator (sine, ~5.5Hz), never stopped once
+  created**, fanned out through a per-voice gain node (`vibratoScaleGain`)
+  into each oscillator's `detune` AudioParam. `GestureAnalyzer` tracks
+  same-axis reversal (a sign flip in the projection of movement onto the
+  locked axis) and reports a decaying `vibratoIntensity` (0-1);
+  `setExpression` scales that by the ensemble's max cents (Brass ±6,
+  Strings ±14) per voice, every pointer move.
+- **Axis-based corner detection replaces distance-triggered chord changes.**
+  `gesture.ts`'s axis angle is computed mod 180° (a line and its opposite
+  direction are the same axis), a rolling ~100ms window smooths noisy
+  instantaneous direction, and a candidate axis must both exceed a ~40°
+  deviation from the locked axis *and* hold for ~24px/~75ms before it's
+  confirmed as a corner (a ~150ms cooldown then guards against a second
+  immediate re-trigger). This is a pure, DOM-free module — `spec/gesture.test.ts`
+  drives it with synthetic pointer traces (straight lines, jitter, reversals,
+  clean corners, cooldown, gentle curves) rather than requiring a human to
+  judge gesture sensitivity by feel for every change.
+- **Master gain is 0.22, plus a ~36Hz master high-pass filter** to remove
+  unnecessary sub-bass energy — chosen and checked on this machine's laptop
+  speakers/headphones only. **A real-phone listening pass has not yet been
+  done** — do not treat this level, the per-voice balance table (soprano
+  1.00 / alto 0.75 / tenor 0.52 / bass 0.33), or the vibrato depth as
+  confirmed until that happens (see `PROCESS.md`/`reflections/crit-4.md` for
+  current verification status).
+- **Notation is computed, never hand-positioned.** `notation.ts`'s
+  `pitchToStaffPosition(pitchName, clef)` derives a note's staff line/space
+  from `diatonicStep` relative to each clef's bottom-line reference note —
+  verified against the reference SVG's exact G7 layout and standard
+  ledger-line conventions in `spec/notation.test.ts`. The SVG score renderer
+  that consumes this (replacing the old fading-dot `visualization.ts`) has
+  not been built yet.
 - **Symphonic Strings preset exists in `audio.ts` and is reachable via the
-  ensemble toggle / `E` key, but is untested by ear.** Brass Choir is the only
+  ensemble toggle / `2` key, but is untested by ear.** Brass Choir is the only
   ensemble that has been listened to and is confirmed as the safety-net MVP
   per the build brief; Strings should not be presented as verified until a
   human listening pass covers it too.

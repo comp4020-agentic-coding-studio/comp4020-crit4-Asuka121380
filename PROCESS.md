@@ -46,20 +46,112 @@ non-persistent score.
    "file not typechecked" surprise later.
    ([`70e2079`](https://github.com/comp4020-agentic-coding-studio/comp4020-crit4-Asuka121380/commit/70e2079))
 
-## Verification status (honest, as of this commit)
+## Verification status as of the MVP commit
 
-- `pnpm check` is green: 57 tests pass, including the pre-existing crit-4
+- `pnpm check` was green: 57 tests pass, including the pre-existing crit-4
   contract tests (Web Audio synthesis present, no `<audio>`/`<video>`
   fallback, pointer *and* keyboard input both wired) and the invariants.
-- **Not yet done**: any real-browser interaction test (dragging, the actual
-  sound, click-free envelope confirmation by ear), any mobile/touch device
-  test, any viewport check at 1920×1080 or 390×844, and deployment. These
-  require a real browser and, for the mobile checks, a physical phone —
-  outside what this environment can do. `pnpm preview` was used only to
-  confirm the built page serves valid markup; no audio or gesture behaviour
-  has been observed running.
-- Symphonic Strings is implemented (reachable via the `E` key / ensemble
-  toggle) but has not been listened to — Brass Choir is the only ensemble
-  currently claimed as working.
-- Next: get a human (device + ears) to confirm first-gesture sound, then
-  deploy the Brass-only safety-net version per section 16 step 8.
+- **Not yet done at that point**: any real-browser interaction test, any
+  mobile/touch device test, any viewport check at 1920×1080 or 390×844, and
+  deployment. `pnpm preview` was used only to confirm the built page serves
+  valid markup; no audio or gesture behaviour had been observed running.
+- The MVP was subsequently deployed to GitHub Pages (repo made public, Pages
+  enabled, CI green) and the live URL was verified with `curl`.
+
+## Refinement: sustained pointer-lifecycle audio + axis-based gesture model
+
+Following `C4_GESTURE_AUDIO_UI_REFINEMENT_PROMPT.md`, the MVP's timed
+one-shot chords and distance-threshold triggering were replaced with the
+interaction model that document specifies: `pointer down → sustain current
+chord → speed controls volume → same movement axis keeps harmony →
+same-axis reversal increases vibrato → confirmed corner advances harmony →
+audio and displayed notation update from the same voicing object → pointer
+up releases the chord`. The prompt's own ordering instruction ("do not let
+notation or visual polish block deployment of the corrected audio and
+gesture model") was followed deliberately: this pass covers only the
+audio/gesture vertical slice (steps 1-7 of the refinement's priority list);
+the notation renderer, ensemble icon buttons, obsolete-instruction removal,
+and baton/visual-reference work are still pending and are the next slice.
+
+1. **`audio.ts` was rewritten around sustained voices, not timed envelopes.**
+   `AudioEngine.startChord`/`.changeChord`/`.releaseChord` now track a flat,
+   role-tagged (`"current" | "fading"`) `activeVoices` array instead of
+   firing a fixed-duration chord per trigger. A confirmed corner crossfades
+   the previous chord out while the new one comes in, and the polyphony cap
+   dropped from 16 (four-per-chord, multiple overlapping one-shots) to 8
+   (four for the current chord, four for at most one fading-out generation)
+   because sustained chords no longer need headroom for several overlapping
+   one-shots at once. The MVP's proven fix — remove a stolen voice from the
+   bookkeeping array immediately, don't wait for the browser's `ended` event
+   — was reused and generalised so it also governs the crossfade-out path; a
+   new stress test in `spec/audio.test.ts` runs 30 corners across 7 chord
+   symbols and a second asserts two back-to-back `changeChord` calls never
+   let three generations coexist (would show 12 voices; caps at 8).
+2. **Voice balance and speed-to-volume are now separate, composable
+   controls.** A static per-voice relative-gain table (soprano 1.00 / alto
+   0.75 / tenor 0.52 / bass 0.33) is baked into each voice's envelope peak so
+   the bass never dominates regardless of how loud the chord is overall; a
+   pure, independently-tested `speedToLevel` function maps pointer speed to
+   an overall level with a held-minimum floor (holding still never goes
+   silent) and is applied continuously via `linearRampToValueAtTime`, not as
+   a step function.
+3. **`gesture.ts` is a new, pure, DOM-free module replacing the old
+   accumulated-distance trigger.** It computes a movement axis modulo 180°
+   (so a line and its reverse are the same axis), requires both an angle
+   deviation and a sustained distance/time before confirming a corner (so a
+   gentle curve or hand jitter doesn't retrigger harmony), and separately
+   tracks same-axis reversal as a decaying vibrato intensity rather than a
+   harmony change. Being pure and DOM-independent meant this could be
+   verified with synthetic pointer traces (`spec/gesture.test.ts`: straight
+   lines, jitter, reversals, a clean corner, a cooldown-guarded second turn,
+   two well-separated corners, a slow arc) instead of only by feel.
+   **Bug found and fixed during this**: the very first qualifying sample had
+   only one point in its direction-estimation window, so `dx=dy=0` and the
+   axis came out as a degenerate 0° — locked in as the gesture's real axis
+   regardless of its actual direction, which would have falsely registered a
+   corner on the second sample of almost any diagonal gesture. Fixed by
+   requiring at least two points in the window before computing an axis.
+4. **Vibrato is one shared LFO, not one per voice.** A single sine
+   oscillator at ~5.5Hz, created once and never stopped, fans out through a
+   per-voice gain node into each oscillator's `detune` AudioParam — the
+   standard Web Audio parameter-modulation pattern — scaled per pointer move
+   by the gesture analyzer's decaying reversal-intensity signal.
+5. **A TypeScript narrowing bug surfaced while rewiring `main.ts`.** Three
+   helper functions that read DOM elements already null-checked by an outer
+   `if` were declared with `function`, and `tsc --noEmit` still reported them
+   as possibly `null` — TypeScript doesn't propagate narrowing from an
+   enclosing block into a *hoisted* function declaration's body. Converting
+   them to `const fn = (...) => {...}` arrow expressions (matching the
+   pattern the rest of the file already used for its callbacks) restored the
+   narrowing and cleared the error.
+6. **Space/arrow-key conducting and the distance-threshold trigger were
+   removed outright**, not kept behind a flag — `interaction.ts` now
+   recognises only pointer lifecycle plus `1`/`2` keydown shortcuts for
+   ensemble selection, per the refinement prompt's explicit "do not restore
+   Clear or keyboard conducting" constraint (keyboard input for ensemble
+   selection is retained deliberately, to keep the "more than one input
+   modality" contract satisfied). The `index.html` aria-label and
+   keyboard-hint text, which had gone stale the moment Space/arrow handling
+   was removed, were corrected in the same pass so the shipped interim state
+   doesn't mislead a user about how to operate it — the Clear button and
+   single-toggle ensemble button themselves are unchanged for now; their
+   removal/replacement is part of the still-pending notation/UI slice.
+
+## Verification status (honest, as of this refinement)
+
+- `pnpm check` is green: **9 test files, 82 tests passing**, including new
+  suites for `gesture.ts` (axis/corner/vibrato, all synthetic-trace-driven)
+  and the rewritten `audio.ts` (sustained-voice lifecycle, cap-under-stress,
+  crossfade-generation limits), plus additions to `spec/voicing.test.ts`
+  (exact-G7 voicing, `diatonicStep`/`parsePitchName` behaviour).
+- **Not yet done**: any real-browser or real-device listening/gesture pass
+  on this refined audio/gesture model — the balance table, the
+  speed-to-volume feel, corner sensitivity, and vibrato depth are all only
+  verified against synthetic fakes so far, not by ear or by hand. Notation
+  rendering (an SVG score replacing the old fading-dot lanes), the two
+  ensemble icon buttons, Clear-button removal, and the baton/visual-reference
+  restyle are not yet built.
+- Next: commit and deploy this slice, verify the live URL serves it, then
+  stop and ask for a human listening/gesture pass at the checkpoints named
+  in the refinement prompt (balance/clarity, speed-to-volume, corner
+  sensitivity, vibrato depth) before starting the notation/UI slice.

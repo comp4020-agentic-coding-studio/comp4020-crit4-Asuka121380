@@ -1,36 +1,34 @@
-// Distance travelled while pressed, in CSS pixels, before one new chord
-// triggers and the accumulator resets. Faster motion crosses this more
-// often, producing a denser rhythm.
-export const DISTANCE_THRESHOLD_PX = 55;
-
-// Space-held keyboard conducting simulates movement on a steady tick rather
-// than a real pointer trace — documented here per section 6's "pick one" —
-// then feeds the same accumulate/threshold path pointer input uses.
-const KEYBOARD_TICK_MS = 60;
-const KEYBOARD_STEP_PX = 7;
-
-const ARROW_NUDGE_PX = 18;
+import { GestureAnalyzer, type GestureFrame } from "./gesture";
+import type { Ensemble } from "./voicing";
 
 export type ConductingCallbacks = {
   /** Fired once, the very first time any conducting gesture begins. */
   onFirstGesture: () => void;
-  /** Fired every time accumulated distance crosses the threshold. */
-  onChordTrigger: () => void;
-  /** Baton screen position changed — visual only, never mapped to pitch. */
+  /** Pointer down: sustain begins. */
+  onGestureStart: () => void;
+  /** Every pointer move while held: smoothed speed, whether this sample
+   *  confirmed a corner (harmony should advance), and vibrato intensity. */
+  onGestureMove: (frame: GestureFrame) => void;
+  /** Pointer up (or cancel): sustain releases. */
+  onGestureEnd: () => void;
+  /** Baton screen position — visual only, never mapped to pitch. */
   onBatonMove?: (clientX: number, clientY: number) => void;
-  onToggleEnsemble?: () => void;
-  onReset?: () => void;
+  /** Instantaneous raw movement heading in degrees, for the baton's
+   *  rotation — independent of the axis-lock state that gates corners. */
+  onBatonRotate?: (angleDegrees: number) => void;
+  onSelectEnsemble?: (ensemble: Ensemble) => void;
 };
 
+const ROTATE_MIN_DISTANCE_PX = 2;
+
 export class ConductingController {
-  private accumulatedDistance = 0;
-  private lastX = 0;
-  private lastY = 0;
+  private readonly analyzer = new GestureAnalyzer();
   private pointerPressed = false;
   private hasGestured = false;
-  private keyboardTimer: ReturnType<typeof setInterval> | null = null;
   private batonX: number;
   private batonY: number;
+  private lastX = 0;
+  private lastY = 0;
 
   constructor(
     private readonly surface: HTMLElement,
@@ -48,7 +46,6 @@ export class ConductingController {
     window.addEventListener("pointerup", this.handlePointerUp);
     window.addEventListener("pointercancel", this.handlePointerUp);
     window.addEventListener("keydown", this.handleKeyDown);
-    window.addEventListener("keyup", this.handleKeyUp);
   }
 
   private noteFirstGesture(): void {
@@ -57,37 +54,40 @@ export class ConductingController {
     this.callbacks.onFirstGesture();
   }
 
-  private accumulate(distance: number): void {
-    this.accumulatedDistance += distance;
-    if (this.accumulatedDistance >= DISTANCE_THRESHOLD_PX) {
-      this.accumulatedDistance = 0;
-      this.callbacks.onChordTrigger();
-    }
-  }
-
   private handlePointerDown = (event: PointerEvent): void => {
     event.preventDefault();
     this.noteFirstGesture();
     this.pointerPressed = true;
-    this.accumulatedDistance = 0;
     this.lastX = event.clientX;
     this.lastY = event.clientY;
+    this.analyzer.reset();
+    this.analyzer.addSample(event.timeStamp, event.clientX, event.clientY);
     this.moveBatonTo(event.clientX, event.clientY);
     this.surface.setPointerCapture(event.pointerId);
+    this.callbacks.onGestureStart();
   };
 
   private handlePointerMove = (event: PointerEvent): void => {
     if (!this.pointerPressed) return;
+
     const dx = event.clientX - this.lastX;
     const dy = event.clientY - this.lastY;
-    this.lastX = event.clientX;
-    this.lastY = event.clientY;
+    if (Math.hypot(dx, dy) >= ROTATE_MIN_DISTANCE_PX) {
+      const angleDegrees = (Math.atan2(dy, dx) * 180) / Math.PI;
+      this.callbacks.onBatonRotate?.(angleDegrees);
+      this.lastX = event.clientX;
+      this.lastY = event.clientY;
+    }
+
+    const frame = this.analyzer.addSample(event.timeStamp, event.clientX, event.clientY);
     this.moveBatonTo(event.clientX, event.clientY);
-    this.accumulate(Math.hypot(dx, dy));
+    this.callbacks.onGestureMove(frame);
   };
 
   private handlePointerUp = (): void => {
+    if (!this.pointerPressed) return;
     this.pointerPressed = false;
+    this.callbacks.onGestureEnd();
   };
 
   private moveBatonTo(clientX: number, clientY: number): void {
@@ -97,59 +97,15 @@ export class ConductingController {
     this.callbacks.onBatonMove?.(this.batonX, this.batonY);
   }
 
-  private nudgeBaton(dx: number, dy: number): void {
-    const rect = this.surface.getBoundingClientRect();
-    this.batonX = Math.min(Math.max(this.batonX + dx, 0), rect.width);
-    this.batonY = Math.min(Math.max(this.batonY + dy, 0), rect.height);
-    this.callbacks.onBatonMove?.(this.batonX, this.batonY);
-  }
-
-  private startKeyboardConducting(): void {
-    if (this.keyboardTimer) return;
-    this.accumulatedDistance = 0;
-    let angle = 0;
-    this.keyboardTimer = setInterval(() => {
-      angle += Math.PI / 3;
-      this.nudgeBaton(Math.cos(angle) * (KEYBOARD_STEP_PX / 2), Math.sin(angle) * (KEYBOARD_STEP_PX / 2));
-      this.accumulate(KEYBOARD_STEP_PX);
-    }, KEYBOARD_TICK_MS);
-  }
-
-  private stopKeyboardConducting(): void {
-    if (!this.keyboardTimer) return;
-    clearInterval(this.keyboardTimer);
-    this.keyboardTimer = null;
-  }
-
+  // "1"/"2" select an ensemble outright — the keyboard's equivalent of
+  // pressing one of the two ensemble icon buttons (section 8), and what
+  // keeps this a genuinely multi-modal instrument now that Space/arrow-key
+  // conducting is gone.
   private handleKeyDown = (event: KeyboardEvent): void => {
-    if (event.code === "Space") {
-      event.preventDefault();
-      if (event.repeat) return;
-      this.noteFirstGesture();
-      this.startKeyboardConducting();
-      return;
-    }
-    if (event.code === "ArrowUp" || event.code === "ArrowDown" || event.code === "ArrowLeft" || event.code === "ArrowRight") {
-      event.preventDefault();
-      if (event.code === "ArrowUp") this.nudgeBaton(0, -ARROW_NUDGE_PX);
-      if (event.code === "ArrowDown") this.nudgeBaton(0, ARROW_NUDGE_PX);
-      if (event.code === "ArrowLeft") this.nudgeBaton(-ARROW_NUDGE_PX, 0);
-      if (event.code === "ArrowRight") this.nudgeBaton(ARROW_NUDGE_PX, 0);
-      return;
-    }
-    if (event.key.toLowerCase() === "e") {
-      this.callbacks.onToggleEnsemble?.();
-      return;
-    }
-    if (event.key.toLowerCase() === "r") {
-      this.callbacks.onReset?.();
-    }
-  };
-
-  private handleKeyUp = (event: KeyboardEvent): void => {
-    if (event.code === "Space") {
-      event.preventDefault();
-      this.stopKeyboardConducting();
+    if (event.key === "1") {
+      this.callbacks.onSelectEnsemble?.("brass");
+    } else if (event.key === "2") {
+      this.callbacks.onSelectEnsemble?.("strings");
     }
   };
 }

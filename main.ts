@@ -1,5 +1,5 @@
-import { AudioEngine, noteDurationSeconds } from "./audio";
-import { buildChordEvent } from "./chordEvent";
+import { AudioEngine, speedToLevel } from "./audio";
+import { buildChordEvent, type ChordEvent } from "./chordEvent";
 import { INITIAL_STATE, sampleChordSymbol, sampleNextState, type HarmonicState } from "./harmony";
 import { ConductingController } from "./interaction";
 import { mulberry32 } from "./rng";
@@ -42,59 +42,79 @@ if (
   let ensemble: Ensemble = "brass";
   let harmonicState: HarmonicState = INITIAL_STATE;
 
-  function ensembleLabel(): string {
-    return ensemble === "brass" ? "Brass Choir" : "Symphonic Strings";
-  }
-
-  function triggerChord(): void {
-    harmonicState = sampleNextState(harmonicState, random);
+  const buildCurrentEvent = (): ChordEvent => {
     const chordSymbol = sampleChordSymbol(harmonicState, random);
     const notes = voiceChord(chordSymbol, ensemble);
-    const context = audioEngine.ensureContext();
-    const event = buildChordEvent({
-      harmonicState,
-      chordSymbol,
-      notes,
+    return buildChordEvent({ harmonicState, chordSymbol, notes, ensemble });
+  };
+
+  // The chord currently sustaining (or last sustained) — audio and the score
+  // notation are always driven from this same object, never a separate
+  // decorative copy.
+  let currentEvent: ChordEvent = buildCurrentEvent();
+
+  const ensembleLabel = (): string => (ensemble === "brass" ? "Brass Choir" : "Symphonic Strings");
+
+  const selectEnsemble = (next: Ensemble): void => {
+    if (ensemble === next) return;
+    ensemble = next;
+    ensembleToggle.textContent = ensembleLabel();
+    ensembleToggle.setAttribute("aria-pressed", String(ensemble === "strings"));
+    statusRegion.textContent = `${ensembleLabel()} selected.`;
+    // Re-voice the same chord under the new ensemble's instrument names —
+    // the sounding pitches are identical, so only the display relabels
+    // immediately. A currently-sustaining voice keeps its own timbre until
+    // the next chord change or new hold.
+    currentEvent = buildChordEvent({
+      harmonicState: currentEvent.harmonicState,
+      chordSymbol: currentEvent.chordSymbol,
+      notes: voiceChord(currentEvent.chordSymbol, ensemble),
       ensemble,
-      startedAtSeconds: context.currentTime,
-      durationSeconds: noteDurationSeconds(ensemble),
     });
-    audioEngine.playChord(event);
-    visualizer.showChord(event);
-  }
+    visualizer.showChord(currentEvent);
+  };
 
   const controller = new ConductingController(surface, {
     onFirstGesture: () => {
       audioEngine.ensureContext();
       invitation.classList.add("invitation-hidden");
-      triggerChord();
     },
-    onChordTrigger: triggerChord,
+    onGestureStart: () => {
+      audioEngine.ensureContext();
+      audioEngine.startChord(currentEvent);
+      visualizer.showChord(currentEvent);
+    },
+    onGestureMove: (frame) => {
+      const level = speedToLevel(frame.speed);
+      audioEngine.setExpression(level, frame.vibratoIntensity);
+      if (frame.chordChangeTriggered) {
+        harmonicState = sampleNextState(harmonicState, random);
+        currentEvent = buildCurrentEvent();
+        audioEngine.changeChord(currentEvent);
+        visualizer.showChord(currentEvent);
+      }
+    },
+    onGestureEnd: () => {
+      audioEngine.releaseChord();
+    },
     onBatonMove: (x, y) => {
       baton.style.setProperty("--baton-x", `${x}px`);
       baton.style.setProperty("--baton-y", `${y}px`);
     },
-    onToggleEnsemble: () => {
-      ensemble = ensemble === "brass" ? "strings" : "brass";
-      ensembleToggle.textContent = ensembleLabel();
-      ensembleToggle.setAttribute("aria-pressed", String(ensemble === "strings"));
-      statusRegion.textContent = `${ensembleLabel()} selected.`;
+    onBatonRotate: (angleDegrees) => {
+      baton.style.setProperty("--baton-angle", `${angleDegrees}deg`);
     },
-    onReset: () => {
-      harmonicState = INITIAL_STATE;
-      statusRegion.textContent = "Harmony reset.";
-    },
+    onSelectEnsemble: selectEnsemble,
   });
 
   ensembleToggle.addEventListener("click", () => {
-    ensemble = ensemble === "brass" ? "strings" : "brass";
-    ensembleToggle.textContent = ensembleLabel();
-    ensembleToggle.setAttribute("aria-pressed", String(ensemble === "strings"));
-    statusRegion.textContent = `${ensembleLabel()} selected.`;
+    selectEnsemble(ensemble === "brass" ? "strings" : "brass");
   });
 
   resetButton.addEventListener("click", () => {
     harmonicState = INITIAL_STATE;
+    currentEvent = buildCurrentEvent();
+    visualizer.showChord(currentEvent);
     statusRegion.textContent = "Harmony reset.";
   });
 

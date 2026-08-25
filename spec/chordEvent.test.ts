@@ -19,8 +19,6 @@ describe("ChordEvent: shape and consistency", () => {
         chordSymbol,
         notes,
         ensemble: "brass",
-        startedAtSeconds: i,
-        durationSeconds: 1,
       });
 
       expect(event.notes).toHaveLength(4);
@@ -31,22 +29,8 @@ describe("ChordEvent: shape and consistency", () => {
 
   it("gives every event a distinct id", () => {
     const notes = voiceChord("C", "brass");
-    const a = buildChordEvent({
-      harmonicState: "I",
-      chordSymbol: "C",
-      notes,
-      ensemble: "brass",
-      startedAtSeconds: 0,
-      durationSeconds: 1,
-    });
-    const b = buildChordEvent({
-      harmonicState: "I",
-      chordSymbol: "C",
-      notes,
-      ensemble: "brass",
-      startedAtSeconds: 1,
-      durationSeconds: 1,
-    });
+    const a = buildChordEvent({ harmonicState: "I", chordSymbol: "C", notes, ensemble: "brass" });
+    const b = buildChordEvent({ harmonicState: "I", chordSymbol: "C", notes, ensemble: "brass" });
     expect(a.id).not.toBe(b.id);
   });
 });

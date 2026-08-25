@@ -1,94 +1,130 @@
 import type { ChordEvent } from "./chordEvent";
-import type { Ensemble } from "./voicing";
+import type { Ensemble, Voice, VoicedNote } from "./voicing";
 
-// A concrete polyphony cap (section 11): the maximum number of simultaneously
-// active single-note voices before the oldest is stolen/faded. Four voices
-// per chord means this comfortably covers a few overlapping chords during
-// fast conducting before anything is stolen.
-export const MAX_ACTIVE_VOICES = 16;
+// Polyphony cap (refinement section 3): four voices for the sustaining chord
+// plus four for the previous chord while a crossfade is still in flight —
+// never more, because a confirmed corner always steals any leftover
+// crossfade-out group immediately rather than letting a third generation
+// accumulate.
+export const MAX_ACTIVE_VOICES = 8;
 
-// Master gain is clamped conservatively; confirmed safe on this machine's
-// laptop speakers and headphones during development, but a real-phone
-// listening pass is still required before calling audio "done" (section 18).
-const MASTER_GAIN = 0.2;
-const PEAK_VOICE_GAIN = 0.22;
+const MASTER_GAIN = 0.22;
+const MASTER_HIGHPASS_HZ = 36;
+
+const ATTACK_SECONDS = 0.05;
+const CROSSFADE_SECONDS = 0.13;
+const RELEASE_SECONDS = 0.3;
 const STEAL_FADE_SECONDS = 0.03;
+const EXPRESSION_SMOOTHING_SECONDS = 0.06;
+const VIBRATO_RATE_HZ = 5.5;
+
+// Per-voice relative gain balance (section 2): upper voices carry the melodic
+// line clearly, the bass anchors without dominating.
+const VOICE_RELATIVE_GAIN: Record<Voice, number> = {
+  soprano: 1.0,
+  alto: 0.75,
+  tenor: 0.52,
+  bass: 0.33,
+};
+
+// Continuous-dynamics mapping (section 3): smoothed pointer speed (px/s) to a
+// gain level, with a held-minimum floor so holding the pointer still doesn't
+// silence the chord.
+const SPEED_FLOOR_PX_S = 40;
+const SPEED_CEILING_PX_S = 900;
+const HELD_MINIMUM_LEVEL = 0.13;
+
+export function speedToLevel(speedPxPerSec: number): number {
+  if (speedPxPerSec <= SPEED_FLOOR_PX_S) return HELD_MINIMUM_LEVEL;
+  if (speedPxPerSec >= SPEED_CEILING_PX_S) return 1;
+  const t = (speedPxPerSec - SPEED_FLOOR_PX_S) / (SPEED_CEILING_PX_S - SPEED_FLOOR_PX_S);
+  return HELD_MINIMUM_LEVEL + t * (1 - HELD_MINIMUM_LEVEL);
+}
 
 type Preset = {
-  attackSeconds: number;
-  holdSeconds: number;
-  releaseSeconds: number;
-  filterFrequency: number;
-  filterQ: number;
   oscillatorType: OscillatorType;
-  detuneCents: number;
+  filterFrequencyByVoice: Record<Voice, number>;
+  filterQ: number;
+  /** Detune depth in cents at full (1.0) vibrato intensity. */
+  vibratoCents: number;
 };
 
-// Brass Choir (required, section 10): fast attack, bright filtered
-// sawtooth, firm release, no detune between unison layers.
+// Brass Choir (section 6): bright sawtooth, brighter filtering on upper
+// voices than the bass, modest vibrato depth (±4-8 cents at full intensity).
 const BRASS_PRESET: Preset = {
-  attackSeconds: 0.015,
-  holdSeconds: 0.55,
-  releaseSeconds: 0.35,
-  filterFrequency: 2600,
-  filterQ: 1.1,
   oscillatorType: "sawtooth",
-  detuneCents: 0,
+  filterFrequencyByVoice: { soprano: 3400, alto: 2800, tenor: 1800, bass: 1100 },
+  filterQ: 1.0,
+  vibratoCents: 6,
 };
 
-// Symphonic Strings (optional, section 10): slow attack, darker filter,
-// long release, subtle unison detune for shimmer.
+// Symphonic Strings: darker filtering, wider vibrato depth (±10-18 cents).
 const STRINGS_PRESET: Preset = {
-  attackSeconds: 0.16,
-  holdSeconds: 0.7,
-  releaseSeconds: 0.9,
-  filterFrequency: 900,
-  filterQ: 0.6,
   oscillatorType: "sawtooth",
-  detuneCents: 7,
+  filterFrequencyByVoice: { soprano: 2600, alto: 2000, tenor: 1300, bass: 800 },
+  filterQ: 0.7,
+  vibratoCents: 14,
 };
 
 function presetFor(ensemble: Ensemble): Preset {
   return ensemble === "brass" ? BRASS_PRESET : STRINGS_PRESET;
 }
 
-/** Total audible length of a note in this ensemble's preset — used both to
- *  schedule the envelope and to stamp `ChordEvent.durationSeconds`. */
-export function noteDurationSeconds(ensemble: Ensemble): number {
-  const preset = presetFor(ensemble);
-  return preset.attackSeconds + preset.holdSeconds + preset.releaseSeconds;
-}
-
 function midiToFrequency(midi: number): number {
   return 440 * 2 ** ((midi - 69) / 12);
 }
 
+type VoiceRole = "current" | "fading";
+
 type ActiveVoice = {
-  oscillators: OscillatorNode[];
-  gain: GainNode;
+  oscillator: OscillatorNode;
   filter: BiquadFilterNode;
-  stopped: boolean;
+  levelGain: GainNode;
+  envelopeGain: GainNode;
+  vibratoScaleGain: GainNode;
+  maxVibratoCents: number;
+  role: VoiceRole;
 };
 
-/** Synthesis-only audio engine (section 10-11): one shared `AudioContext`
- *  constructed lazily on the first user gesture, oscillator/filter/gain
- *  voices with click-free envelopes, a capped and voice-stealing polyphony
- *  pool, routed through one clamped master gain. */
+/** Sustained-voice audio engine (refinement sections 1-4): a chord's four
+ *  voices persist for as long as the pointer holds it, rather than firing a
+ *  timed one-shot envelope. A confirmed corner crossfades from the outgoing
+ *  chord to the incoming one; pointer-up releases the held chord. Continuous
+ *  pointer speed drives a shared gain level, and same-axis reversal drives a
+ *  shared vibrato LFO's modulation depth per voice. */
 export class AudioEngine {
   private context: AudioContext | null = null;
   private masterGain: GainNode | null = null;
+  private masterHighpass: BiquadFilterNode | null = null;
+  private lfoOsc: OscillatorNode | null = null;
   private activeVoices: ActiveVoice[] = [];
+  private currentLevel = HELD_MINIMUM_LEVEL;
+  private currentVibratoIntensity = 0;
 
   /** Must be called synchronously from inside a user-gesture handler
    *  (pointerdown / keydown) — never at module load. */
   ensureContext(): AudioContext {
     if (!this.context) {
       const context = new AudioContext();
+
       const masterGain = context.createGain();
       masterGain.gain.value = MASTER_GAIN;
+
+      const masterHighpass = context.createBiquadFilter();
+      masterHighpass.type = "highpass";
+      masterHighpass.frequency.value = MASTER_HIGHPASS_HZ;
+      masterHighpass.connect(masterGain);
       masterGain.connect(context.destination);
+
+      const lfoOsc = context.createOscillator();
+      lfoOsc.type = "sine";
+      lfoOsc.frequency.value = VIBRATO_RATE_HZ;
+      lfoOsc.start();
+
       this.context = context;
       this.masterGain = masterGain;
+      this.masterHighpass = masterHighpass;
+      this.lfoOsc = lfoOsc;
     }
     if (this.context.state === "suspended") {
       void this.context.resume();
@@ -104,70 +140,137 @@ export class AudioEngine {
     return this.activeVoices.length;
   }
 
-  playChord(event: ChordEvent): void {
-    const context = this.context;
-    const masterGain = this.masterGain;
-    if (!context || !masterGain) return;
-
-    const preset = presetFor(event.ensemble);
-    const startTime = context.currentTime;
-
-    for (const note of event.notes) {
-      this.stealOldestIfAtCap();
-
-      const gain = context.createGain();
-      gain.gain.setValueAtTime(0, startTime);
-
-      const filter = context.createBiquadFilter();
-      filter.type = "lowpass";
-      filter.frequency.value = preset.filterFrequency;
-      filter.Q.value = preset.filterQ;
-
-      const frequency = midiToFrequency(note.midi);
-      const oscillators: OscillatorNode[] = [];
-
-      const mainOsc = context.createOscillator();
-      mainOsc.type = preset.oscillatorType;
-      mainOsc.frequency.value = frequency;
-      mainOsc.connect(filter);
-      oscillators.push(mainOsc);
-
-      if (preset.detuneCents > 0) {
-        const detunedOsc = context.createOscillator();
-        detunedOsc.type = preset.oscillatorType;
-        detunedOsc.frequency.value = frequency;
-        detunedOsc.detune.value = preset.detuneCents;
-        detunedOsc.connect(filter);
-        oscillators.push(detunedOsc);
-      }
-
-      filter.connect(gain);
-      gain.connect(masterGain);
-
-      // Click-free envelope: linear attack to peak, hold, linear release.
-      const attackEnd = startTime + preset.attackSeconds;
-      const releaseStart = attackEnd + preset.holdSeconds;
-      const releaseEnd = releaseStart + preset.releaseSeconds;
-      gain.gain.linearRampToValueAtTime(PEAK_VOICE_GAIN, attackEnd);
-      gain.gain.setValueAtTime(PEAK_VOICE_GAIN, releaseStart);
-      gain.gain.linearRampToValueAtTime(0, releaseEnd);
-
-      for (const osc of oscillators) {
-        osc.start(startTime);
-        osc.stop(releaseEnd + 0.05);
-      }
-
-      const voice: ActiveVoice = { oscillators, gain, filter, stopped: false };
-      this.activeVoices.push(voice);
-
-      const cleanup = () => {
-        voice.stopped = true;
-        gain.disconnect();
-        filter.disconnect();
-        this.activeVoices = this.activeVoices.filter((v) => v !== voice);
-      };
-      mainOsc.addEventListener("ended", cleanup, { once: true });
+  /** Begins sustaining a chord from silence (pointer-down). Any leftover
+   *  voices from an incomplete previous release are cut short first — this
+   *  should not normally happen, since release only starts on pointer-up. */
+  startChord(event: ChordEvent): void {
+    if (!this.context || !this.masterHighpass) return;
+    for (const voice of this.activeVoices.filter((v) => v.role === "current")) {
+      this.fadeOutVoice(voice, STEAL_FADE_SECONDS);
     }
+    const preset = presetFor(event.ensemble);
+    for (const note of event.notes) this.createVoice(note, preset, ATTACK_SECONDS);
+  }
+
+  /** Crossfades from the currently-sustaining chord to a new one (a
+   *  confirmed corner). The outgoing chord fades out over the same window
+   *  the incoming one fades in, so the two overlap rather than cutting. */
+  changeChord(event: ChordEvent): void {
+    if (!this.context || !this.masterHighpass) return;
+    if (this.activeVoices.every((v) => v.role !== "current")) {
+      this.startChord(event);
+      return;
+    }
+    for (const voice of this.activeVoices.filter((v) => v.role === "current")) {
+      this.fadeOutVoice(voice, CROSSFADE_SECONDS);
+    }
+    const preset = presetFor(event.ensemble);
+    for (const note of event.notes) this.createVoice(note, preset, CROSSFADE_SECONDS);
+  }
+
+  /** Releases the held chord (pointer-up). */
+  releaseChord(): void {
+    for (const voice of this.activeVoices.filter((v) => v.role === "current")) {
+      this.fadeOutVoice(voice, RELEASE_SECONDS);
+    }
+  }
+
+  /** Continuous expression update, called on every pointer move: `level`
+   *  (0-1, see `speedToLevel`) drives the shared volume, `vibratoIntensity`
+   *  (0-1) drives the shared LFO's per-voice modulation depth. Only the
+   *  currently-sustaining chord responds — a chord already fading out keeps
+   *  its own envelope, undisturbed. */
+  setExpression(level: number, vibratoIntensity: number): void {
+    if (!this.context) return;
+    this.currentLevel = level;
+    this.currentVibratoIntensity = vibratoIntensity;
+    const target = this.context.currentTime + EXPRESSION_SMOOTHING_SECONDS;
+    for (const voice of this.activeVoices) {
+      if (voice.role !== "current") continue;
+      voice.levelGain.gain.linearRampToValueAtTime(level, target);
+      voice.vibratoScaleGain.gain.linearRampToValueAtTime(vibratoIntensity * voice.maxVibratoCents, target);
+    }
+  }
+
+  private createVoice(note: VoicedNote, preset: Preset, attackSeconds: number): void {
+    const context = this.context;
+    const masterHighpass = this.masterHighpass;
+    if (!context || !masterHighpass) return;
+    this.stealOldestIfAtCap();
+
+    const now = context.currentTime;
+
+    const oscillator = context.createOscillator();
+    oscillator.type = preset.oscillatorType;
+    oscillator.frequency.value = midiToFrequency(note.midi);
+
+    const filter = context.createBiquadFilter();
+    filter.type = "lowpass";
+    filter.frequency.value = preset.filterFrequencyByVoice[note.voice];
+    filter.Q.value = preset.filterQ;
+
+    const levelGain = context.createGain();
+    levelGain.gain.value = this.currentLevel;
+
+    const envelopeGain = context.createGain();
+    envelopeGain.gain.setValueAtTime(0, now);
+    envelopeGain.gain.linearRampToValueAtTime(VOICE_RELATIVE_GAIN[note.voice], now + attackSeconds);
+
+    const vibratoScaleGain = context.createGain();
+    vibratoScaleGain.gain.value = this.currentVibratoIntensity * preset.vibratoCents;
+
+    oscillator.connect(filter);
+    filter.connect(levelGain);
+    levelGain.connect(envelopeGain);
+    envelopeGain.connect(masterHighpass);
+
+    if (this.lfoOsc) {
+      this.lfoOsc.connect(vibratoScaleGain);
+      vibratoScaleGain.connect(oscillator.detune);
+    }
+
+    oscillator.start(now);
+
+    this.activeVoices.push({
+      oscillator,
+      filter,
+      levelGain,
+      envelopeGain,
+      vibratoScaleGain,
+      maxVibratoCents: preset.vibratoCents,
+      role: "current",
+    });
+  }
+
+  private fadeOutVoice(voice: ActiveVoice, fadeSeconds: number): void {
+    const context = this.context;
+    if (!context) return;
+    voice.role = "fading";
+
+    const now = context.currentTime;
+    const gainParam = voice.envelopeGain.gain;
+    if (typeof gainParam.cancelAndHoldAtTime === "function") {
+      gainParam.cancelAndHoldAtTime(now);
+    } else {
+      gainParam.cancelScheduledValues(now);
+    }
+    gainParam.linearRampToValueAtTime(0, now + fadeSeconds);
+
+    const stopAt = now + fadeSeconds + 0.02;
+    try {
+      voice.oscillator.stop(stopAt);
+    } catch {
+      // already scheduled to stop — nothing to do.
+    }
+
+    const cleanup = () => {
+      voice.envelopeGain.disconnect();
+      voice.filter.disconnect();
+      voice.levelGain.disconnect();
+      voice.vibratoScaleGain.disconnect();
+      this.activeVoices = this.activeVoices.filter((v) => v !== voice);
+    };
+    voice.oscillator.addEventListener("ended", cleanup, { once: true });
   }
 
   private stealOldestIfAtCap(): void {
@@ -177,26 +280,22 @@ export class AudioEngine {
     if (!context || !oldest) return;
 
     // Drop it from the pool immediately so the cap is enforced the instant
-    // it's exceeded — the fade-out below still finishes the sound cleanly in
-    // the audio graph, but bookkeeping never has to wait for the browser's
-    // 'ended' event to catch up during rapid, sustained conducting.
+    // it's exceeded — bookkeeping never waits for the browser's 'ended'
+    // event to catch up during a rapid run of corner changes.
     this.activeVoices.shift();
-    oldest.stopped = true;
 
     const now = context.currentTime;
-    const gainParam = oldest.gain.gain;
+    const gainParam = oldest.envelopeGain.gain;
     if (typeof gainParam.cancelAndHoldAtTime === "function") {
       gainParam.cancelAndHoldAtTime(now);
     } else {
       gainParam.cancelScheduledValues(now);
     }
     gainParam.linearRampToValueAtTime(0, now + STEAL_FADE_SECONDS);
-    for (const osc of oldest.oscillators) {
-      try {
-        osc.stop(now + STEAL_FADE_SECONDS + 0.01);
-      } catch {
-        // already scheduled to stop — nothing to do.
-      }
+    try {
+      oldest.oscillator.stop(now + STEAL_FADE_SECONDS + 0.01);
+    } catch {
+      // already scheduled to stop — nothing to do.
     }
   }
 }

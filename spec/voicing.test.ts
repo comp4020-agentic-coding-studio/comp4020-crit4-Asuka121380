@@ -1,6 +1,14 @@
 import { describe, expect, it } from "vitest";
 import { CHORD_COLOUR_TABLE } from "../harmony";
-import { INSTRUMENT_NAMES, VOICING_TABLE, VOICE_ORDER, pitchNameToMidi, voiceChord } from "../voicing";
+import {
+  INSTRUMENT_NAMES,
+  VOICING_TABLE,
+  VOICE_ORDER,
+  diatonicStep,
+  parsePitchName,
+  pitchNameToMidi,
+  voiceChord,
+} from "../voicing";
 
 describe("voicing: pitch-name to MIDI", () => {
   it.each([
@@ -50,5 +58,31 @@ describe("voicing: fixed fallback table", () => {
 
   it("throws for a chord symbol with no fixed voicing", () => {
     expect(() => voiceChord("Xmaj9", "brass")).toThrow();
+  });
+
+  // The refinement prompt's exact requirement: G7 must sound (and, per
+  // notation.test.ts, display) as Trumpet/Violin B4, Horn/Viola F4,
+  // Trombone/Cello D3, Tuba/Double Bass G2.
+  it("voices G7 exactly as required: bass G2, tenor D3, alto F4, soprano B4", () => {
+    expect(VOICING_TABLE.G7).toEqual({ bass: "G2", tenor: "D3", alto: "F4", soprano: "B4" });
+  });
+});
+
+describe("voicing: parsePitchName / diatonicStep", () => {
+  it("parses letter, accidental, and octave", () => {
+    expect(parsePitchName("Ab3")).toEqual({ letter: "A", accidental: "b", octave: 3 });
+    expect(parsePitchName("F#2")).toEqual({ letter: "F", accidental: "#", octave: 2 });
+    expect(parsePitchName("C4")).toEqual({ letter: "C", accidental: "", octave: 4 });
+  });
+
+  it("counts diatonic steps by letter and octave only, ignoring accidental", () => {
+    expect(diatonicStep("C4")).toBe(diatonicStep("C4"));
+    expect(diatonicStep("Ab3")).toBe(diatonicStep("A3"));
+    expect(diatonicStep("F#2")).toBe(diatonicStep("F2"));
+  });
+
+  it("increases by exactly one per adjacent letter, and by seven per octave", () => {
+    expect(diatonicStep("D4") - diatonicStep("C4")).toBe(1);
+    expect(diatonicStep("C5") - diatonicStep("C4")).toBe(7);
   });
 });
