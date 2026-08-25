@@ -211,7 +211,15 @@ concrete problems, each addressed directly:
   not the felt result on a phone. Notation rendering, the two ensemble icon
   buttons, Clear-button removal, and the baton/visual-reference restyle are
   still not built.
-- Next: deploy this tuning pass, verify the live URL, then ask for a second
-  listening/gesture checkpoint (sharp corner, gentle curve, jitter,
-  slow-to-fast, fast-to-slow, release at low and high volume) before
-  starting the notation/UI slice.
+- Deployed: commit `d66faf4` pushed to `main`, CI run `32811004086`
+  completed with `conclusion=success`. Verified the live URL
+  (`https://comp4020-agentic-coding-studio.github.io/comp4020-crit4-Asuka121380/`)
+  serves this exact build — downloaded the live `index-CgvIYUQI.js` and
+  diffed it byte-for-byte against a clean local `pnpm build` output; they
+  are identical, and the bundle contains the new spike-clamp constant
+  (`4000` minified to `4e3`).
+- Second listening/gesture checkpoint requested from the user (sharp
+  corner, gentle curve, jitter, slow-to-fast, fast-to-slow, release at low
+  and high volume) — awaiting their retest before starting the notation/UI
+  slice, per their explicit instruction not to begin it until these three
+  feel issues are retested and confirmed.
