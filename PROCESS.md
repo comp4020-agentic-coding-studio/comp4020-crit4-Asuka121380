@@ -5,11 +5,16 @@ A reading-guide to how the work came together, following
 
 ## What I built
 
-The Living Score: a browser instrument where conducting an invisible ensemble
-with mouse, touch, or keyboard triggers chords chosen by a small Markov
-harmony system, voiced by a fixed four-part table, and briefly rendered as a
-glowing chord symbol and four fading gold note-markers on a transient,
-non-persistent score.
+The Living Score is a browser instrument conducted with pointer or touch.
+Movement speed shapes dynamics, same-axis reversals add vibrato, and a clear
+corner advances a chord chosen by a small Markov harmony system. Each chord is
+voiced by a fixed four-part table and drives both the Web Audio ensemble and a
+real four-stave SVG conductor score from the same `ChordEvent`. The player can
+switch between distinct synthetic Brass Choir and Symphonic Strings presets
+with two visible controls or the `1`/`2` keys. The current concert-pitch notes,
+clefs, accidentals and ledger lines update together, while a visible baton
+follows and rotates with the conducting gesture. There is no score history,
+rhythm notation, keyboard conducting, or Clear/reset control in the final UI.
 
 ## The moments that mattered
 

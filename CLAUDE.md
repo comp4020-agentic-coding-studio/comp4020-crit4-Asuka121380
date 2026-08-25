@@ -54,7 +54,8 @@ here and wire it into `check`. Growing this file is the work.
   glob matches only root-level files, not a subdirectory. Adding a `src/`
   folder would silently drop those files from typecheck. `main.ts` and every
   module it imports (`harmony.ts`, `voicing.ts`, `chordEvent.ts`, `audio.ts`,
-  `interaction.ts`, `visualization.ts`, `rng.ts`) stay flat at the root.
+  `interaction.ts`, `notation.ts`, `score.ts`, `rng.ts`) stay flat at the
+  root.
 - **`stylelint-config-standard` rejects BEM naming.** Its default
   `selector-class-pattern` is strict kebab-case (`^[a-z]([-a-z0-9]+)?$`), so
   `__element` and `--modifier` class names (e.g. `.tile__art`,
@@ -162,9 +163,9 @@ here and wire it into `check`. Growing this file is the work.
   would only have traded discrimination for an illusion of responsiveness,
   since the corner→`changeChord()` call itself was already same-tick
   (verified: no React, no `setTimeout`/rAF/Promise anywhere between gesture
-  confirmation and the audio call — this app has no framework at all,
-  `visualization.ts`'s rAF/`setTimeout` only animate a decorative dot *after*
-  audio has already been scheduled).
+  confirmation and the audio call — this app has no framework at all, and
+  `ScoreRenderer.showChord()` updates the notation only *after* audio has
+  already been scheduled).
 - **Every automation call schedules from `context.currentTime +
   SCHEDULING_LOOKAHEAD_SECONDS` (8ms), never from `context.currentTime`
   directly — this is the fix for Mac/Safari-specific chord-change latency.**
@@ -377,16 +378,17 @@ here and wire it into `check`. Growing this file is the work.
   375px-wide viewport was actually driven with pointer events at
   `interaction.ts`'s reported edge coordinates — `.score { overflow: hidden }`
   is the fix, not clamping the baton's tracked position in `interaction.ts`.
-- **Symphonic Strings preset exists in `audio.ts` and is reachable via the two
-  explicit Brass 🎺 / Strings 🎻 buttons in `index.html` (or `1`/`2`), but is
-  untested by ear.** Brass Choir is the only ensemble that has been listened
-  to and is confirmed as the safety-net MVP per the build brief; Strings
-  should not be presented as verified until a human listening pass covers it
-  too. The two presets now also differ in attack shape (`Preset.attackScale`
-  — Brass 1, an unscaled near-instant onset; Strings 1.6, a slower bow-swell)
-  on top of the pre-existing filter/vibrato differences, and switching
-  ensembles while a chord is sustaining crossfades it into the new timbre
-  immediately via `AudioEngine.retimbreChord()` (`changeChord()`'s crossfade
-  path, factored out as `crossfadeToCurrent()`, reused rather than
-  duplicated) — it deliberately no-ops when nothing is currently sustaining,
-  so toggling the control while idle never starts sound on its own.
+- **Brass and Strings are separate layered synthesis presets, selected by two
+  inline-SVG buttons in `index.html` (or `1`/`2`).** Brass uses a sawtooth
+  core, square/saw colour layers, a short pitch scoop, a brighter attack
+  transient, stronger movement-linked filter opening, restrained vibrato and
+  mild saturation. Strings uses a triangle core with detuned saw colour
+  layers, a subtle filtered bow-noise burst, delayed/deeper vibrato, a slower
+  attack, darker filtering and a longer release. Per-voice oscillator mix,
+  filter, gain, vibrato, noise and transient values distinguish the four
+  register roles while retaining the quieter bass balance. Switching while a
+  chord is sustaining crossfades immediately through
+  `AudioEngine.retimbreChord()`/`crossfadeToCurrent()`; switching while idle
+  deliberately starts no sound. The graph and scheduling differences are
+  tested, but the latest presets still require a human listening pass before
+  their realism and perceived-loudness match can be claimed as verified.
