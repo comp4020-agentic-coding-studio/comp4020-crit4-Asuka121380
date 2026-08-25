@@ -51,8 +51,18 @@ h1 {
 .controls {
   display: flex;
   justify-content: center;
+  align-items: center;
   gap: 0.75rem;
   margin-bottom: 1.5rem;
+}
+
+.ensemble-group {
+  display: flex;
+  gap: 0.4rem;
+}
+
+.ensemble-icon {
+  margin-right: 0.3rem;
 }
 
 .controls button {

@@ -102,23 +102,34 @@ type Preset = {
   filterQ: number;
   /** Detune depth in cents at full (1.0) vibrato intensity. */
   vibratoCents: number;
+  /** Multiplies whatever attack duration the caller passes to createVoice
+   *  (GESTURE_START_ATTACK_SECONDS or INCOMING_ATTACK_SECONDS) — brass is
+   *  articulate (a near-instant onset), bowed strings swell in gradually.
+   *  Brass stays at 1 (the un-scaled baseline the existing attack-timing
+   *  tests were written against); only strings scales up. */
+  attackScale: number;
 };
 
 // Brass Choir (section 6): bright sawtooth, brighter filtering on upper
-// voices than the bass, modest vibrato depth (±4-8 cents at full intensity).
+// voices than the bass, modest vibrato depth (±4-8 cents at full intensity),
+// a near-instant attack.
 const BRASS_PRESET: Preset = {
   oscillatorType: "sawtooth",
   filterFrequencyByVoice: { soprano: 3400, alto: 2800, tenor: 1800, bass: 1100 },
   filterQ: 1.0,
   vibratoCents: 6,
+  attackScale: 1,
 };
 
-// Symphonic Strings: darker filtering, wider vibrato depth (±10-18 cents).
+// Symphonic Strings: darker filtering, wider vibrato depth (±10-18 cents),
+// and a slower bow-swell attack (60% longer) rather than brass's near-instant
+// onset — the clearest single audible cue that a switch actually happened.
 const STRINGS_PRESET: Preset = {
   oscillatorType: "sawtooth",
   filterFrequencyByVoice: { soprano: 2600, alto: 2000, tenor: 1300, bass: 800 },
   filterQ: 0.7,
   vibratoCents: 14,
+  attackScale: 1.6,
 };
 
 function presetFor(ensemble: Ensemble): Preset {
@@ -282,6 +293,22 @@ export class AudioEngine {
         `[timing] audio engine received chord at performance.now()=${performance.now().toFixed(2)}, context.currentTime=${this.context.currentTime.toFixed(4)}, scheduled start=${(this.context.currentTime + SCHEDULING_LOOKAHEAD_SECONDS).toFixed(4)}`,
       );
     }
+    this.crossfadeToCurrent(event);
+  }
+
+  /** Re-voices the chord currently sustaining under a new ensemble preset,
+   *  using the exact same crossfade timing as a confirmed corner
+   *  (changeChord above) — so switching Brass/Strings mid-hold is audible
+   *  immediately rather than waiting for the next corner. A no-op when
+   *  nothing is currently sustaining: toggling the ensemble control while
+   *  idle must never start sound playing on its own. */
+  retimbreChord(event: ChordEvent): void {
+    if (!this.context || !this.masterHighpass) return;
+    if (this.activeVoices.every((v) => v.role !== "current")) return;
+    this.crossfadeToCurrent(event);
+  }
+
+  private crossfadeToCurrent(event: ChordEvent): void {
     for (const voice of this.activeVoices.filter((v) => v.role === "current")) {
       this.fadeOutVoice(voice, OUTGOING_FADE_SECONDS);
     }
@@ -345,7 +372,10 @@ export class AudioEngine {
 
     const envelopeGain = context.createGain();
     envelopeGain.gain.setValueAtTime(0, startAt);
-    envelopeGain.gain.linearRampToValueAtTime(VOICE_RELATIVE_GAIN[note.voice], startAt + attackSeconds);
+    envelopeGain.gain.linearRampToValueAtTime(
+      VOICE_RELATIVE_GAIN[note.voice],
+      startAt + attackSeconds * preset.attackScale,
+    );
 
     const vibratoScaleGain = context.createGain();
     vibratoScaleGain.gain.value = this.currentVibratoIntensity * preset.vibratoCents;

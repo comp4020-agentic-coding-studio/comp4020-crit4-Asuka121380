@@ -855,3 +855,55 @@ it genuinely cannot resolve an incoming segment until 30px of clean travel
 exists *purely* in the new direction (60px total including the outgoing
 side). That's correct, conservative behaviour, not a bug, so the test was
 rewritten to use realistic leg lengths instead of chasing that edge case.
+
+## Ensemble UI: two explicit controls, and switching is now audible
+
+Verified rather than reimplemented first: `BRASS_PRESET`/`STRINGS_PRESET`
+already existed in `audio.ts` (differing in filter frequency/Q and vibrato
+depth; both sawtooth), and ensemble selection already worked via a single
+cycling `#ensemble-toggle` button plus `1`/`2` keys wired through
+`ConductingController`'s `onSelectEnsemble` callback. Reading `selectEnsemble()`
+in `main.ts` confirmed switching mid-sustain only relabelled the current
+`ChordEvent` and re-voiced it for the score display — it never called
+`audioEngine.changeChord()`, so a held chord kept its old timbre until the
+next corner or the next gesture.
+
+Two changes, both additive:
+
+1. **Two visible controls.** `index.html`'s single toggle became a labelled
+   `role="group"` of two buttons (`#ensemble-brass` 🎺, `#ensemble-strings`
+   🎻), each driving its own `aria-pressed` state (the existing
+   `.controls button[aria-pressed="true"]` gold-highlight styling in
+   `styles.css` applies unchanged). `main.ts` wires each button directly to
+   `selectEnsemble("brass")`/`selectEnsemble("strings")` instead of a
+   toggle-and-cycle click handler. The `1`/`2` keyboard shortcuts needed no
+   change — they already called `onSelectEnsemble` with an explicit target.
+
+2. **Switching is audible immediately.** Added `AudioEngine.retimbreChord()`,
+   which reuses `changeChord()`'s exact crossfade path (extracted into a
+   shared private `crossfadeToCurrent()`) but is a deliberate no-op when no
+   voice currently has `role: "current"` — toggling the ensemble control
+   while idle must never start sound playing on its own. `selectEnsemble()`
+   now calls it after re-voicing the display copy, so a chord already
+   sustaining crossfades into the new timbre on the same button click, with
+   no need to wait for the next corner or the next hold.
+
+3. **Brass and Strings are more clearly distinct.** Both already differed in
+   filter frequency/Q and vibrato depth; added a third, more perceptually
+   obvious cue — attack shape. `Preset` gained `attackScale`, multiplying
+   whatever attack duration `createVoice` is given. Brass keeps
+   `attackScale: 1` (the exact pre-existing baseline the older attack-timing
+   tests assert against, so nothing about brass's sound changed). Strings
+   gets `attackScale: 1.6` — a slower bow-like swell instead of brass's
+   near-instant onset, audible on every new chord and on every ensemble
+   switch alike, without a second oscillator, samples, or any other
+   synthesis-architecture change.
+
+Three new tests cover this in `spec/audio.test.ts`: `retimbreChord` no-ops
+with no chord sustaining, crossfades correctly (4 fading + 4 current voices,
+darker filtering on the incoming strings voices) when one is, and Strings'
+attack ramp lands later than Brass's while Brass's stays exactly at the old
+baseline. `pnpm check`: **9 test files, 124 tests passing**, `tsc --noEmit`
+clean, `vite build` succeeds. As before, `spec/audio.test.ts`'s fake
+`AudioContext` graph verifies node-level scheduling correctness only — actual
+click-free/timbre/balance perception still needs a human listening pass.

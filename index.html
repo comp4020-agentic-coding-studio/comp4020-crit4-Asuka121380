@@ -25,7 +25,14 @@
       <h1>The Living Score</h1>
 
       <div class="controls">
-        <button type="button" id="ensemble-toggle" aria-pressed="false">Brass Choir</button>
+        <div class="ensemble-group" role="group" aria-label="Ensemble">
+          <button type="button" id="ensemble-brass" class="ensemble-button" aria-pressed="true">
+            <span class="ensemble-icon" aria-hidden="true">🎺</span> Brass
+          </button>
+          <button type="button" id="ensemble-strings" class="ensemble-button" aria-pressed="false">
+            <span class="ensemble-icon" aria-hidden="true">🎻</span> Strings
+          </button>
+        </div>
         <button type="button" id="reset-button">Clear</button>
       </div>
 

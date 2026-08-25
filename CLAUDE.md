@@ -347,8 +347,16 @@ here and wire it into `check`. Growing this file is the work.
   ledger-line conventions in `spec/notation.test.ts`. The SVG score renderer
   that consumes this (replacing the old fading-dot `visualization.ts`) has
   not been built yet.
-- **Symphonic Strings preset exists in `audio.ts` and is reachable via the
-  ensemble toggle / `2` key, but is untested by ear.** Brass Choir is the only
-  ensemble that has been listened to and is confirmed as the safety-net MVP
-  per the build brief; Strings should not be presented as verified until a
-  human listening pass covers it too.
+- **Symphonic Strings preset exists in `audio.ts` and is reachable via the two
+  explicit Brass 🎺 / Strings 🎻 buttons in `index.html` (or `1`/`2`), but is
+  untested by ear.** Brass Choir is the only ensemble that has been listened
+  to and is confirmed as the safety-net MVP per the build brief; Strings
+  should not be presented as verified until a human listening pass covers it
+  too. The two presets now also differ in attack shape (`Preset.attackScale`
+  — Brass 1, an unscaled near-instant onset; Strings 1.6, a slower bow-swell)
+  on top of the pre-existing filter/vibrato differences, and switching
+  ensembles while a chord is sustaining crossfades it into the new timbre
+  immediately via `AudioEngine.retimbreChord()` (`changeChord()`'s crossfade
+  path, factored out as `crossfadeToCurrent()`, reused rather than
+  duplicated) — it deliberately no-ops when nothing is currently sustaining,
+  so toggling the control while idle never starts sound on its own.

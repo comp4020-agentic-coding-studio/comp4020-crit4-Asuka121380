@@ -118,12 +118,12 @@ afterEach(() => {
   (globalThis as { AudioContext?: unknown }).AudioContext = originalAudioContext;
 });
 
-function chordEvent(symbol: string) {
+function chordEvent(symbol: string, ensemble: "brass" | "strings" = "brass") {
   return buildChordEvent({
     harmonicState: "I",
     chordSymbol: symbol,
-    notes: voiceChord(symbol, "brass"),
-    ensemble: "brass",
+    notes: voiceChord(symbol, ensemble),
+    ensemble,
   });
 }
 
@@ -353,6 +353,71 @@ describe("AudioEngine: sustained pointer-lifecycle voices", () => {
     const secondRampIndex = calls.map((c) => c.method).lastIndexOf("linearRampToValueAtTime");
     const priorCalls = calls.slice(0, secondRampIndex);
     expect(priorCalls.some((c) => c.method === "cancelScheduledValues")).toBe(true);
+  });
+});
+
+describe("AudioEngine: retimbreChord (audible ensemble switching)", () => {
+  it("does nothing when no chord is currently sustaining", () => {
+    const engine = new AudioEngine();
+    engine.ensureContext();
+    expect(() => engine.retimbreChord(chordEvent("C", "strings"))).not.toThrow();
+    expect(engine.activeVoiceCount).toBe(0);
+  });
+
+  it("crossfades the sustaining chord into the new ensemble's timbre immediately", () => {
+    const engine = new AudioEngine();
+    engine.ensureContext();
+    engine.startChord(chordEvent("C", "brass"));
+    engine.retimbreChord(chordEvent("C", "strings"));
+
+    // Same crossfade shape as a confirmed corner: the old (brass) voices are
+    // fading out, new (strings) voices are current — both sets alive at once.
+    expect(engine.activeVoiceCount).toBe(8);
+    const internals = engine as unknown as {
+      activeVoices: Array<{ role: string; filter: { frequency: FakeAudioParam } }>;
+    };
+    const incoming = internals.activeVoices.filter((v) => v.role === "current");
+    const outgoing = internals.activeVoices.filter((v) => v.role === "fading");
+    expect(incoming).toHaveLength(4);
+    expect(outgoing).toHaveLength(4);
+    // Strings' filtering is darker than brass's on every voice.
+    for (let i = 0; i < incoming.length; i++) {
+      expect(incoming[i].filter.frequency.value).toBeLessThan(outgoing[i].filter.frequency.value);
+    }
+  });
+
+  it("does not start audio playing when switching ensembles while idle", () => {
+    const engine = new AudioEngine();
+    engine.ensureContext();
+    engine.retimbreChord(chordEvent("C", "strings"));
+    expect(engine.activeVoiceCount).toBe(0);
+  });
+});
+
+describe("AudioEngine: Brass vs Strings are audibly distinct", () => {
+  it("gives strings a slower attack swell than brass's near-instant onset", () => {
+    const brassEngine = new AudioEngine();
+    brassEngine.ensureContext();
+    brassEngine.startChord(chordEvent("C", "brass"));
+    const stringsEngine = new AudioEngine();
+    stringsEngine.ensureContext();
+    stringsEngine.startChord(chordEvent("C", "strings"));
+
+    const attackTime = (engine: AudioEngine) => {
+      const internals = engine as unknown as {
+        activeVoices: Array<{ envelopeGain: { gain: FakeAudioParam } }>;
+      };
+      const [voice] = internals.activeVoices;
+      const ramp = voice.envelopeGain.gain.calls.find(
+        (c) => c.method === "linearRampToValueAtTime" && c.value > 0,
+      )!;
+      return ramp.time as number;
+    };
+
+    expect(attackTime(stringsEngine)).toBeGreaterThan(attackTime(brassEngine));
+    // Brass's attack is unchanged from the pre-existing baseline other tests
+    // in this file assert against.
+    expect(attackTime(brassEngine)).toBeCloseTo(GESTURE_START_ATTACK_SECONDS + SCHEDULING_LOOKAHEAD_SECONDS);
   });
 });
 

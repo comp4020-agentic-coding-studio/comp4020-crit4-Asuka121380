@@ -11,7 +11,8 @@ const baton = document.querySelector<HTMLElement>("#baton");
 const chordSymbolElement = document.querySelector<HTMLElement>("#chord-symbol");
 const invitation = document.querySelector<HTMLElement>("#invitation");
 const statusRegion = document.querySelector<HTMLElement>("#status");
-const ensembleToggle = document.querySelector<HTMLButtonElement>("#ensemble-toggle");
+const ensembleBrassButton = document.querySelector<HTMLButtonElement>("#ensemble-brass");
+const ensembleStringsButton = document.querySelector<HTMLButtonElement>("#ensemble-strings");
 const resetButton = document.querySelector<HTMLButtonElement>("#reset-button");
 
 const voiceRows: Record<Voice, HTMLElement | null> = {
@@ -27,7 +28,8 @@ if (
   chordSymbolElement &&
   invitation &&
   statusRegion &&
-  ensembleToggle &&
+  ensembleBrassButton &&
+  ensembleStringsButton &&
   resetButton &&
   voiceRows.soprano &&
   voiceRows.alto &&
@@ -58,19 +60,23 @@ if (
   const selectEnsemble = (next: Ensemble): void => {
     if (ensemble === next) return;
     ensemble = next;
-    ensembleToggle.textContent = ensembleLabel();
-    ensembleToggle.setAttribute("aria-pressed", String(ensemble === "strings"));
+    ensembleBrassButton.setAttribute("aria-pressed", String(ensemble === "brass"));
+    ensembleStringsButton.setAttribute("aria-pressed", String(ensemble === "strings"));
     statusRegion.textContent = `${ensembleLabel()} selected.`;
     // Re-voice the same chord under the new ensemble's instrument names —
     // the sounding pitches are identical, so only the display relabels
-    // immediately. A currently-sustaining voice keeps its own timbre until
-    // the next chord change or new hold.
+    // immediately.
     currentEvent = buildChordEvent({
       harmonicState: currentEvent.harmonicState,
       chordSymbol: currentEvent.chordSymbol,
       notes: voiceChord(currentEvent.chordSymbol, ensemble),
       ensemble,
     });
+    // If a chord is currently sustaining, crossfade it into the new
+    // ensemble's timbre right away — switching should be audible
+    // immediately, not only on the next corner or the next hold. No-ops
+    // (see retimbreChord) when nothing is currently sounding.
+    audioEngine.retimbreChord(currentEvent);
     visualizer.showChord(currentEvent);
   };
 
@@ -127,9 +133,8 @@ if (
     onSelectEnsemble: selectEnsemble,
   });
 
-  ensembleToggle.addEventListener("click", () => {
-    selectEnsemble(ensemble === "brass" ? "strings" : "brass");
-  });
+  ensembleBrassButton.addEventListener("click", () => selectEnsemble("brass"));
+  ensembleStringsButton.addEventListener("click", () => selectEnsemble("strings"));
 
   resetButton.addEventListener("click", () => {
     harmonicState = INITIAL_STATE;
