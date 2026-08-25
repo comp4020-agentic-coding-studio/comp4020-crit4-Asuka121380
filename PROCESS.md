@@ -25,7 +25,7 @@ non-persistent score.
    table (section 7) as a fixture, not as the implementation itself — every
    state's derived probabilities matched within rounding tolerance, and a
    dedicated test asserts `IV` and `iv` are never confused.
-   ([`ed0b907`](https://github.com/comp4020-agentic-coding-studio/comp4020-crit4-Asuka121380/commit/ed0b907))
+   ([`70e2079`](https://github.com/comp4020-agentic-coding-studio/comp4020-crit4-Asuka121380/commit/70e2079))
 2. **The polyphony cap didn't actually cap anything on the first pass.**
    `stealOldestIfAtCap` marked the oldest voice `stopped` but left it in the
    `activeVoices` array until the browser's `ended` event fired later, so
@@ -36,7 +36,7 @@ non-persistent score.
    against a cap of `16`) — the fix was to remove the stolen voice from the
    bookkeeping array the instant it's stolen, not wait for `ended`. Recorded
    as a fact in `CLAUDE.md` so a later session doesn't reintroduce it.
-   ([`ed0b907`](https://github.com/comp4020-agentic-coding-studio/comp4020-crit4-Asuka121380/commit/ed0b907))
+   ([`70e2079`](https://github.com/comp4020-agentic-coding-studio/comp4020-crit4-Asuka121380/commit/70e2079))
 3. **`CLAUDE.md` carried a wrong fact forward.** It claimed this repo's
    `tsconfig.json` rejects `.ts` extensions in imports; reading the actual
    file showed `allowImportingTsExtensions: true`. Corrected the note rather
@@ -44,7 +44,7 @@ non-persistent score.
    `*.ts` glob only matching root-level files (so every module stays flat at
    the repo root, not under `src/`) before it could cause a confusing
    "file not typechecked" surprise later.
-   ([`ed0b907`](https://github.com/comp4020-agentic-coding-studio/comp4020-crit4-Asuka121380/commit/ed0b907))
+   ([`70e2079`](https://github.com/comp4020-agentic-coding-studio/comp4020-crit4-Asuka121380/commit/70e2079))
 
 ## Verification status (honest, as of this commit)
 
