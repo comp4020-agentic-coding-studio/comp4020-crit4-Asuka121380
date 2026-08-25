@@ -1,103 +1,94 @@
-// Gesture analysis (refinement prompt sections 2 & 4) — pure and independent
-// of audio/UI code so the corner/vibrato rules can be tested deterministically
-// against synthetic pointer traces, not just judged by feel.
+// Corner detection is deliberately NOT "does cumulative direction change
+// exceed a threshold" (that model let smooth curves accumulate enough drift
+// to fire, since a long gradual arc and a short sharp turn can reach the same
+// total heading change). Instead it looks for the concrete shape of a real
+// corner: a straight incoming run, a concentrated turn, a straight outgoing
+// run. Both runs are evaluated over a *distance* window (not a time window),
+// each is required to be internally straight, and the corner only confirms
+// when the heading genuinely pivots between two already-straight segments.
+//
+// Pointer coordinates arrive in CSS px, which are already device-pixel-ratio
+// independent (a 30px segment is the same physical gesture on a retina
+// laptop trackpad and a low-DPI touchscreen) — so the distance constants
+// below need no extra DPR scaling.
 
-/** Rolling window used to average out per-sample noise before estimating the
- *  current movement axis. A first pass at 100ms felt sluggish (~500ms
- *  corner-to-chord latency); a second pass over-corrected to 60ms and became
- *  too permissive (unintended movements triggered chord changes). Landed at
- *  75ms — the actual fix for felt latency turned out to be downstream, in the
- *  crossfade shape (see `audio.ts`'s `INCOMING_ATTACK_SECONDS`), not this
- *  window, so this constant no longer needs to be pushed to an extreme to
- *  compensate. */
-export const DIRECTION_WINDOW_MS = 75;
+export const NOISE_DISTANCE_PX = 4;
+// Target path length of each stable run on either side of a candidate
+// corner. Conservative per the brief's 24-36px range.
+export const SEGMENT_LENGTH_PX = 30;
+// A segment counts as "stable" when its straight-line chord covers at least
+// this fraction of the path length actually traveled across it. A perfectly
+// straight run scores 1.0; backtracking, wandering, or curving through the
+// segment pulls this below 1. This one ratio check does the job of both
+// "is this segment straight" and "is this segment actually going somewhere
+// rather than jittering in place" — a segment with a low ratio fails either
+// way, which is exactly what should disqualify it as a stable run.
+export const SEGMENT_STRAIGHTNESS_MIN_RATIO = 0.92;
+// Heading must pivot by an angle in [MIN, MAX] between the incoming and
+// outgoing segment to count as a corner. MIN is the brief's suggested
+// default. MAX excludes headings within ~15° of an exact reversal — an
+// out-and-back retrace along the same line is handled by the separate
+// reversal/vibrato detector below, not as a "very sharp corner."
+export const CORNER_ANGLE_MIN_DEG = 70;
+export const CORNER_ANGLE_MAX_DEG = 165;
+// After a corner confirms, the next candidate pivot must be at least this
+// much further along the path — i.e. a fresh stable direction must actually
+// establish itself — before another corner can fire.
+export const CORNER_REARM_DISTANCE_PX = SEGMENT_LENGTH_PX;
+export const CHORD_CHANGE_COOLDOWN_MS = 150;
 
-/** Per-step motion below this is ignored entirely (hand jitter, not a gesture). */
-export const NOISE_DISTANCE_PX = 3;
-
-/** Axis change past this angle (degrees, on the 0-90 mod-π scale) starts a
- *  candidate corner. Restored toward the original conservative range (a 32°
- *  threshold was too easy to cross from ordinary curved motion). */
-export const CORNER_CANDIDATE_DEG = 40;
-
-/** Axis change back below this cancels a pending candidate — the hand drifted
- *  back toward the original axis rather than committing to a turn. Kept a
- *  wide gap under CORNER_CANDIDATE_DEG (20° of hysteresis) so a heading
- *  hovering near the threshold doesn't repeatedly flip candidate/cancelled. */
-export const CORNER_CANCEL_DEG = 20;
-
-/** Distance the candidate axis must hold once past the angle threshold. */
-export const CONFIRM_DISTANCE_PX = 20;
-
-/** Time the candidate axis must hold once past the angle threshold. */
-export const CONFIRM_TIME_MS = 55;
-
-/** Minimum gap between two confirmed chord changes. */
-export const CHORD_CHANGE_COOLDOWN_MS = 110;
-
-/** Exponential smoothing time constant for the speed estimate. Deliberately
- *  independent of DIRECTION_WINDOW_MS above — corner detection and
- *  speed-to-volume are separate signals with separate responsiveness needs,
- *  and sharing one window was never actually happening (this constant only
- *  ever fed `smoothedSpeed`), but is called out explicitly here so a future
- *  change doesn't accidentally couple them. */
 export const SPEED_SMOOTHING_MS = 80;
-
-/** A single instantaneous speed sample above this is treated as an
- *  event-rate/coalescing spike (a burst of pointer events reporting an
- *  implausible jump) and clamped before it reaches the EMA, so one glitchy
- *  sample can't punch a visible jump through the smoothed speed. */
 export const MAX_INSTANTANEOUS_SPEED_PX_S = 4000;
-
-/** A same-axis direction flip below this amplitude is jitter, not vibrato. */
 export const MIN_REVERSAL_PX = 6;
-
-/** How far back to look when judging whether reversals are happening at a
- *  plausible expressive rate. */
 export const VIBRATO_RATE_WINDOW_MS = 700;
-
-/** How much a single qualifying reversal adds to vibrato intensity (0-1). */
 export const VIBRATO_BUMP = 0.32;
-
-/** Exponential decay time constant for vibrato intensity once reversals stop. */
 export const VIBRATO_DECAY_MS = 260;
 
 export type GestureFrame = {
-  /** Smoothed pointer speed in pixels per second. */
   speed: number;
-  /** True exactly once, on the sample that confirms a corner. */
   chordChangeTriggered: boolean;
-  /** 0 (none) to 1 (full) same-axis reversal expression. */
   vibratoIntensity: number;
 };
 
-/** Angle difference on the 0-180° axis (mod π) scale — always 0-90°, since a
- *  line and its opposite direction are the same axis. */
-function axisAngleDifference(a: number, b: number): number {
-  const diff = Math.abs(a - b) % 180;
-  return Math.min(diff, 180 - diff);
-}
+type PathPoint = { t: number; x: number; y: number; cumDist: number };
 
+// Axis angle: a direction folded mod 180°, so a line and its exact reverse
+// share one value. Used only for the reversal/vibrato baseline, where "which
+// line is the hand working along" matters more than which way along it.
 function toAxisAngleDegrees(dx: number, dy: number): number {
   const degrees = (Math.atan2(dy, dx) * 180) / Math.PI;
-  const normalised = ((degrees % 360) + 360) % 360;
-  return normalised % 180;
+  return ((degrees % 360) + 360) % 360 % 180;
 }
 
-type Candidate = { axis: number; startT: number; distance: number; confirmed: boolean };
+// True heading, 0-360°, NOT folded — corner strength needs to tell a sharp
+// V (heading changes ~150°) apart from a gentle bend (heading changes ~20°),
+// which the folded axis angle cannot do (it maps both a 90° turn and a
+// perfect reversal onto the same small range near its fold point).
+function headingDegrees(dx: number, dy: number): number {
+  const degrees = (Math.atan2(dy, dx) * 180) / Math.PI;
+  return ((degrees % 360) + 360) % 360;
+}
+
+function headingDifference(a: number, b: number): number {
+  const diff = Math.abs(a - b) % 360;
+  return Math.min(diff, 360 - diff);
+}
 
 export class GestureAnalyzer {
-  private windowSamples: Array<{ t: number; x: number; y: number }> = [];
+  private points: PathPoint[] = [];
+  private totalDist = 0;
   private activeAxis: number | null = null;
-  private candidate: Candidate | null = null;
+  private lastConfirmedPivotDist = -Infinity;
+  // Guards against a stale cooldown outliving the gesture it was set during
+  // and suppressing the first corner of an unrelated later gesture — see
+  // reset() below.
   private lastChangeAt = -Infinity;
-  private axisSign: -1 | 0 | 1 = 0;
+  private axisSign = 0;
   private reversalTimes: number[] = [];
   private vibratoIntensity = 0;
   private smoothedSpeed = 0;
   private prev: { t: number; x: number; y: number } | null = null;
 
-  /** Feed one pointer sample (monotonically increasing timestamp, in ms). */
   addSample(t: number, x: number, y: number): GestureFrame {
     let chordChangeTriggered = false;
 
@@ -110,16 +101,13 @@ export class GestureAnalyzer {
         const instantaneousSpeed = Math.min(distance / (dt / 1000), MAX_INSTANTANEOUS_SPEED_PX_S);
         const alpha = 1 - Math.exp(-dt / SPEED_SMOOTHING_MS);
         this.smoothedSpeed += (instantaneousSpeed - this.smoothedSpeed) * alpha;
-
         this.decayVibrato(dt);
 
         if (distance >= NOISE_DISTANCE_PX) {
-          this.windowSamples.push({ t, x, y });
-          const windowStart = t - DIRECTION_WINDOW_MS;
-          while (this.windowSamples.length > 1 && this.windowSamples[0].t < windowStart) {
-            this.windowSamples.shift();
-          }
-          chordChangeTriggered = this.processDirection(t, distance);
+          this.totalDist += distance;
+          this.points.push({ t, x, y, cumDist: this.totalDist });
+          this.trimPoints();
+          chordChangeTriggered = this.detectCorner(t);
           this.processReversal(t, dx, dy);
         }
       }
@@ -129,86 +117,86 @@ export class GestureAnalyzer {
     return { speed: this.smoothedSpeed, chordChangeTriggered, vibratoIntensity: this.vibratoIntensity };
   }
 
-  /** Resets axis/candidate/vibrato state for a fresh pointer-down — a new
-   *  gesture shouldn't inherit the previous one's committed axis. */
   reset(): void {
-    this.windowSamples = [];
+    this.points = [];
+    this.totalDist = 0;
     this.activeAxis = null;
-    this.candidate = null;
+    this.lastConfirmedPivotDist = -Infinity;
+    this.lastChangeAt = -Infinity;
     this.axisSign = 0;
     this.reversalTimes = [];
     this.vibratoIntensity = 0;
     this.smoothedSpeed = 0;
     this.prev = null;
-    // lastChangeAt used to deliberately survive a reset, on the theory that
-    // the cooldown is a real-time guard rather than a per-gesture counter.
-    // In practice that let a stale cooldown from the end of one gesture
-    // suppress the very first corner of the next one (release, then quickly
-    // start a new phrase with an immediate turn) — a real source of felt
-    // latency, not just a hypothetical. A fresh gesture now starts with a
-    // clean slate.
-    this.lastChangeAt = -Infinity;
   }
 
-  private processDirection(t: number, stepDistance: number): boolean {
-    // Fewer than two points in the window means there's no real direction
-    // yet — computing one from a single point degenerates to 0° and would
-    // falsely look like a corner as soon as a second, differently-angled
-    // sample arrives.
-    if (this.windowSamples.length < 2) return false;
+  private detectCorner(t: number): boolean {
+    const end = this.points[this.points.length - 1];
 
-    const windowStart = this.windowSamples[0];
-    const windowEnd = this.windowSamples[this.windowSamples.length - 1];
-    const axis = toAxisAngleDegrees(windowEnd.x - windowStart.x, windowEnd.y - windowStart.y);
-
-    if (this.activeAxis === null) {
-      this.activeAxis = axis;
-      return false;
+    if (this.activeAxis === null && this.points.length >= 2) {
+      const prevPoint = this.points[this.points.length - 2];
+      this.activeAxis = toAxisAngleDegrees(end.x - prevPoint.x, end.y - prevPoint.y);
     }
 
-    const diffFromActive = axisAngleDifference(axis, this.activeAxis);
+    const pivot = this.findAtOrBefore(end.cumDist - SEGMENT_LENGTH_PX);
+    if (!pivot) return false;
+    const incomingStart = this.findAtOrBefore(pivot.cumDist - SEGMENT_LENGTH_PX);
+    if (!incomingStart) return false;
 
-    if (this.candidate === null) {
-      if (diffFromActive > CORNER_CANDIDATE_DEG) {
-        this.candidate = { axis, startT: t, distance: 0, confirmed: false };
-      }
-    } else if (!this.candidate.confirmed) {
-      const diffFromCandidate = axisAngleDifference(axis, this.candidate.axis);
-      if (diffFromActive <= CORNER_CANCEL_DEG) {
-        this.candidate = null;
-      } else if (diffFromCandidate > CORNER_CANDIDATE_DEG) {
-        this.candidate = { axis, startT: t, distance: 0, confirmed: false };
-      } else {
-        this.candidate.distance += stepDistance;
-        if (this.candidate.distance >= CONFIRM_DISTANCE_PX && t - this.candidate.startT >= CONFIRM_TIME_MS) {
-          this.candidate.confirmed = true;
-        }
-      }
+    if (!this.isStableSegment(incomingStart, pivot)) return false;
+    if (!this.isStableSegment(pivot, end)) return false;
+
+    const incomingHeading = headingDegrees(pivot.x - incomingStart.x, pivot.y - incomingStart.y);
+    const outgoingHeading = headingDegrees(end.x - pivot.x, end.y - pivot.y);
+    const turnAngle = headingDifference(incomingHeading, outgoingHeading);
+
+    if (turnAngle < CORNER_ANGLE_MIN_DEG || turnAngle > CORNER_ANGLE_MAX_DEG) return false;
+    if (pivot.cumDist - this.lastConfirmedPivotDist < CORNER_REARM_DISTANCE_PX) return false;
+    if (t - this.lastChangeAt < CHORD_CHANGE_COOLDOWN_MS) return false;
+
+    this.activeAxis = outgoingHeading % 180;
+    this.lastConfirmedPivotDist = pivot.cumDist;
+    this.lastChangeAt = t;
+    this.axisSign = 0;
+    this.reversalTimes = [];
+    return true;
+  }
+
+  private isStableSegment(start: PathPoint, end: PathPoint): boolean {
+    const span = end.cumDist - start.cumDist;
+    if (span <= 0) return false;
+    const chordLength = Math.hypot(end.x - start.x, end.y - start.y);
+    return chordLength / span >= SEGMENT_STRAIGHTNESS_MIN_RATIO;
+  }
+
+  private findAtOrBefore(cumDist: number): PathPoint | null {
+    let result: PathPoint | null = null;
+    for (const p of this.points) {
+      if (p.cumDist <= cumDist) result = p;
+      else break;
     }
+    return result;
+  }
 
-    if (this.candidate?.confirmed && t - this.lastChangeAt >= CHORD_CHANGE_COOLDOWN_MS) {
-      this.activeAxis = this.candidate.axis;
-      this.candidate = null;
-      this.lastChangeAt = t;
-      this.axisSign = 0;
-      this.reversalTimes = [];
-      return true;
+  private trimPoints(): void {
+    const cutoff = this.totalDist - SEGMENT_LENGTH_PX * 3;
+    while (this.points.length > 1 && this.points[0].cumDist < cutoff) {
+      this.points.shift();
     }
-
-    return false;
   }
 
   private processReversal(t: number, dx: number, dy: number): void {
     if (this.activeAxis === null) return;
     const radians = (this.activeAxis * Math.PI) / 180;
-    const projection = dx * Math.cos(radians) + dy * Math.sin(radians);
+    const axisDx = Math.cos(radians);
+    const axisDy = Math.sin(radians);
+    const projection = dx * axisDx + dy * axisDy;
     if (Math.abs(projection) < MIN_REVERSAL_PX) return;
 
-    const sign: -1 | 1 = projection > 0 ? 1 : -1;
+    const sign = projection > 0 ? 1 : -1;
     if (this.axisSign !== 0 && sign !== this.axisSign) {
       this.reversalTimes.push(t);
-      const windowStart = t - VIBRATO_RATE_WINDOW_MS;
-      this.reversalTimes = this.reversalTimes.filter((time) => time >= windowStart);
+      this.reversalTimes = this.reversalTimes.filter((rt) => t - rt <= VIBRATO_RATE_WINDOW_MS);
       this.vibratoIntensity = Math.min(1, this.vibratoIntensity + VIBRATO_BUMP);
     }
     this.axisSign = sign;
