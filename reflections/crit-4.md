@@ -101,3 +101,53 @@ sensitivity, vibrato depth) rather than compressing rounds "until it seems
 right" isn't formality — it's how a feel property with no test actually gets
 verified: by trading with a real listener across as many rounds as it takes,
 not by getting to a checkpoint once and assuming it stuck.
+
+## After the failed tuning attempt
+
+The second pass came back, and it was a genuinely different kind of failure
+than the first: not "these three numbers are off," but "the previous round's
+whole framing was wrong." I had treated the first listening pass's latency
+complaint as a gesture-confirmation problem and tuned `gesture.ts`'s
+thresholds down to fix it. The user's follow-up message pointed out,
+correctly, that this could not have been the real cause on its own — if
+confirmation gets faster but the *audible* chord still lags, the delay must
+be downstream of confirmation, in the audio graph itself. That's an
+uncomfortable thing to have missed, because I had, in the previous round,
+written down "the crossfade window was already narrow, so the latency must
+be in gesture confirmation" as if it were a finding — but I had never
+actually instrumented the confirmation→audio boundary to check. It was an
+inference from "I don't see another candidate," not a measurement. This
+round I did the measurement first: grepped for every possible deferral
+mechanism across the whole codebase and found none, which is what let me
+say with actual confidence (not just structural plausibility) that the
+confirmation→invocation leg was same-tick. Only after ruling that leg out
+did I go looking inside the crossfade shape itself, where the real cause
+was — a shared attack/fade duration whose linear ramp shape kept the new
+chord perceptually masked by the old one for most of its early duration.
+The lesson I want to carry forward: "I checked the code path and it looks
+fine" is not the same claim as "I measured the code path and it is fine,"
+and when a human reports a *timing* complaint, only the second claim is
+worth writing down as an explanation.
+
+The second thing this round surfaced was a bug hiding behind a decision I'd
+mentally filed as "deliberate": `GestureAnalyzer.reset()` preserving the
+cooldown timestamp across gesture boundaries. I'd reasoned, when I wrote it,
+that the cooldown is "a real-time guard, not a per-gesture counter," and
+that reasoning felt complete enough that I never wrote a test for what
+happens right after a `reset()`. It took the user explicitly naming
+"cooldown logic delaying the current confirmed chord instead of only
+blocking later triggers" as a thing to check before I went back and noticed
+the theory didn't hold: a cooldown that outlives the gesture it was set
+during can suppress the very first corner of an unrelated, later gesture,
+which is indistinguishable from "corner detection missed a clear turn" to
+the person conducting. This is the same shape of mistake as the polyphony
+cap and the first-sample axis bug from earlier in this build — a piece of
+logic that looked complete because I could narrate a coherent justification
+for it, not because I had tried to break it. The justification itself was
+the trap.
+
+What I'm taking into the next round, if there is one: when a listening pass
+reports "still not better," the right first move is not to retune whatever
+constant looks closest to the complaint — it's to ask "did my previous
+explanation of the cause actually get verified, or did it just sound
+plausible at the time," and go re-check that before touching anything else.

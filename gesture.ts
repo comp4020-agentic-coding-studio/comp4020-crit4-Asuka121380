@@ -3,32 +3,45 @@
 // against synthetic pointer traces, not just judged by feel.
 
 /** Rolling window used to average out per-sample noise before estimating the
- *  current movement axis. Tuned down from an initial 100ms — a clear L-turn
- *  was reading as sluggish (~500ms corner-to-chord latency) at that width. */
-export const DIRECTION_WINDOW_MS = 60;
+ *  current movement axis. A first pass at 100ms felt sluggish (~500ms
+ *  corner-to-chord latency); a second pass over-corrected to 60ms and became
+ *  too permissive (unintended movements triggered chord changes). Landed at
+ *  75ms — the actual fix for felt latency turned out to be downstream, in the
+ *  crossfade shape (see `audio.ts`'s `INCOMING_ATTACK_SECONDS`), not this
+ *  window, so this constant no longer needs to be pushed to an extreme to
+ *  compensate. */
+export const DIRECTION_WINDOW_MS = 75;
 
 /** Per-step motion below this is ignored entirely (hand jitter, not a gesture). */
 export const NOISE_DISTANCE_PX = 3;
 
 /** Axis change past this angle (degrees, on the 0-90 mod-π scale) starts a
- *  candidate corner. */
-export const CORNER_CANDIDATE_DEG = 32;
+ *  candidate corner. Restored toward the original conservative range (a 32°
+ *  threshold was too easy to cross from ordinary curved motion). */
+export const CORNER_CANDIDATE_DEG = 40;
 
 /** Axis change back below this cancels a pending candidate — the hand drifted
- *  back toward the original axis rather than committing to a turn. */
-export const CORNER_CANCEL_DEG = 16;
+ *  back toward the original axis rather than committing to a turn. Kept a
+ *  wide gap under CORNER_CANDIDATE_DEG (20° of hysteresis) so a heading
+ *  hovering near the threshold doesn't repeatedly flip candidate/cancelled. */
+export const CORNER_CANCEL_DEG = 20;
 
 /** Distance the candidate axis must hold once past the angle threshold. */
-export const CONFIRM_DISTANCE_PX = 14;
+export const CONFIRM_DISTANCE_PX = 20;
 
 /** Time the candidate axis must hold once past the angle threshold. */
-export const CONFIRM_TIME_MS = 40;
+export const CONFIRM_TIME_MS = 55;
 
 /** Minimum gap between two confirmed chord changes. */
-export const CHORD_CHANGE_COOLDOWN_MS = 90;
+export const CHORD_CHANGE_COOLDOWN_MS = 110;
 
-/** Exponential smoothing time constant for the speed estimate. */
-export const SPEED_SMOOTHING_MS = 60;
+/** Exponential smoothing time constant for the speed estimate. Deliberately
+ *  independent of DIRECTION_WINDOW_MS above — corner detection and
+ *  speed-to-volume are separate signals with separate responsiveness needs,
+ *  and sharing one window was never actually happening (this constant only
+ *  ever fed `smoothedSpeed`), but is called out explicitly here so a future
+ *  change doesn't accidentally couple them. */
+export const SPEED_SMOOTHING_MS = 80;
 
 /** A single instantaneous speed sample above this is treated as an
  *  event-rate/coalescing spike (a burst of pointer events reporting an
@@ -127,8 +140,14 @@ export class GestureAnalyzer {
     this.vibratoIntensity = 0;
     this.smoothedSpeed = 0;
     this.prev = null;
-    // lastChangeAt deliberately survives a reset: the cooldown is a real-time
-    // guard against rapid re-triggering, not a per-gesture counter.
+    // lastChangeAt used to deliberately survive a reset, on the theory that
+    // the cooldown is a real-time guard rather than a per-gesture counter.
+    // In practice that let a stale cooldown from the end of one gesture
+    // suppress the very first corner of the next one (release, then quickly
+    // start a new phrase with an immediate turn) — a real source of felt
+    // latency, not just a hypothetical. A fresh gesture now starts with a
+    // clean slate.
+    this.lastChangeAt = -Infinity;
   }
 
   private processDirection(t: number, stepDistance: number): boolean {

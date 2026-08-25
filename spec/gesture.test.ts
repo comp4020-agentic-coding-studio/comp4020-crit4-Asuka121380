@@ -130,6 +130,34 @@ describe("GestureAnalyzer: axis and corner detection", () => {
     expect(frame!.speed).toBeLessThan(steadySpeed * 5);
   });
 
+  it("does not let a stale cooldown from a previous gesture block the first corner of a new one", () => {
+    const analyzer = new GestureAnalyzer();
+    // First gesture: establish a corner right at the end (sets lastChangeAt).
+    const first = straightLine(20);
+    let t = first[first.length - 1][0];
+    let x = first[first.length - 1][1];
+    for (const [pt, px, py] of first) analyzer.addSample(pt, px, py);
+    for (let i = 1; i <= 20; i++) {
+      t += 15;
+      analyzer.addSample(t, x, i * 8);
+    }
+    // Pointer up, then immediately (well inside the old cooldown window)
+    // start a brand-new gesture with its own clean corner.
+    analyzer.reset();
+    let frame;
+    const second = straightLine(20);
+    for (const [pt, px, py] of second) frame = analyzer.addSample(pt, px, py);
+    let t2 = second[second.length - 1][0];
+    const x2 = second[second.length - 1][1];
+    let triggered = false;
+    for (let i = 1; i <= 20; i++) {
+      t2 += 15;
+      frame = analyzer.addSample(t2, x2, i * 8);
+      if (frame.chordChangeTriggered) triggered = true;
+    }
+    expect(triggered).toBe(true);
+  });
+
   it("does not burst-fire repeatedly on a single gentle curve", () => {
     const points: Array<[number, number, number]> = [];
     let x = 0;

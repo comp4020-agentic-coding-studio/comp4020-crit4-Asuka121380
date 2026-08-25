@@ -88,9 +88,19 @@ if (
       const level = speedToLevel(frame.speed);
       audioEngine.setExpression(level, frame.vibratoIntensity);
       if (frame.chordChangeTriggered) {
+        // Dev-only timing check for the corner→audio path: `import.meta.env.DEV`
+        // is inlined to `false` by Vite in a production build, so this whole
+        // branch is dead-code-eliminated from the shipped bundle — used to
+        // confirm the confirmation→invocation leg is same-tick, not shipped
+        // as permanent diagnostics.
+        const confirmedAt = import.meta.env.DEV ? performance.now() : 0;
         harmonicState = sampleNextState(harmonicState, random);
         currentEvent = buildCurrentEvent();
         audioEngine.changeChord(currentEvent);
+        if (import.meta.env.DEV) {
+          // eslint-disable-next-line no-console
+          console.debug(`[timing] corner confirmed -> changeChord invoked: ${(performance.now() - confirmedAt).toFixed(2)}ms`);
+        }
         visualizer.showChord(currentEvent);
       }
     },

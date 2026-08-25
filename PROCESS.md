@@ -223,3 +223,124 @@ concrete problems, each addressed directly:
   and high volume) — awaiting their retest before starting the notation/UI
   slice, per their explicit instruction not to begin it until these three
   feel issues are retested and confirmed.
+
+## Failed tuning attempt: diagnosis and architectural rework
+
+The second checkpoint came back negative: the user reported the deployed
+tuning pass "still does not feel meaningfully better" and explicitly framed
+it as a **failed tuning attempt requiring diagnosis and rework, not another
+small constants-only adjustment** — with five concrete complaints (corner
+detection too permissive, audible chord change still lagging visibly behind
+corner confirmation, release still too abrupt, speed-to-volume still stepped,
+overall feel too close to pre-tuning). This section documents the actual
+investigation, because the previous round's mistake was tuning constants
+without first confirming where in the pipeline the delay lived.
+
+1. **Measured the confirmation→invocation leg directly, instead of assuming
+   it was fine.** Grepped every app module (`gesture.ts`, `audio.ts`,
+   `interaction.ts`, `main.ts`, `chordEvent.ts`, `harmony.ts`, `voicing.ts`)
+   for `requestAnimationFrame`/`setTimeout`/`Promise`/`async`/`await` — the
+   only hits are in `visualization.ts`'s decorative fading-dot animation,
+   called *after* `audioEngine.changeChord()` has already run. There is no
+   framework in this app to defer through (no React, no render/effect
+   cycle). Added dev-only `performance.now()` instrumentation around the
+   confirmed-corner branch in `main.ts`, gated by `import.meta.env.DEV` (Vite
+   inlines this to `false` in production, so esbuild/terser dead-code-
+   eliminate the whole branch — confirmed empirically by grepping the built
+   bundle for the debug string and for any `console` reference at all: zero
+   hits either way). **Conclusion: the confirmation→invocation leg was
+   already same-tick.** The felt latency was never there — it was
+   downstream, in the shape of the audio graph's crossfade itself.
+2. **Root cause: a shared crossfade duration was masking the new chord, and
+   the new chord's starting volume could coincide with a natural dip.**
+   `changeChord` previously ramped the incoming and outgoing chords over one
+   shared ~100ms constant. Because a linear 0→target ramp spends most of its
+   early duration at low, easily masked amplitude, the incoming chord wasn't
+   perceptually dominant until nearly the full 100ms had elapsed, while the
+   still-loud outgoing chord masked it throughout — a real, structural cause
+   of the reported post-confirmation lag, not something a tighter gesture
+   threshold could ever fix. Separately, a hand naturally decelerates while
+   pivoting through a sharp corner, so the continuously speed-driven
+   `currentLevel` (which the incoming voice's starting volume was tied to)
+   is often at its lowest exactly when a corner fires — silencing the very
+   sound meant to announce the change. **Both fixes were architectural, not
+   constants-only**: split `INCOMING_ATTACK_SECONDS` (0.04s) from
+   `OUTGOING_FADE_SECONDS` (0.13s) so the new chord establishes fast while
+   the old one can fade more slowly without adding felt latency; added
+   `CORNER_PRESENCE_FLOOR` (0.5) applied only to the incoming voice's
+   initial level at chord-change time, so a corner never starts on a
+   near-silent dip.
+3. **Found and fixed a genuine state-leakage bug, not previously
+   suspected.** `GestureAnalyzer.reset()` had been deliberately preserving
+   `lastChangeAt` (the chord-change cooldown timestamp) across gesture
+   boundaries, on the theory that the cooldown is a real-time guard. On
+   inspection this is a real bug matching the user's own diagnostic
+   question ("cooldown logic delaying the current confirmed chord instead
+   of only blocking later triggers"): a stale cooldown from the end of one
+   gesture could suppress the very first corner of a brand-new gesture
+   (release, then immediately start a new phrase with an immediate turn).
+   Fixed by resetting `lastChangeAt = -Infinity` in `reset()`. A new test
+   (`spec/gesture.test.ts`) runs a first gesture to a confirmed corner,
+   calls `reset()`, then runs a second gesture with its own corner inside
+   the old cooldown window, and asserts it still fires.
+4. **Verified, rather than assumed, that gain automation wasn't stale.**
+   `rampParam` already reads the AudioParam's current value before
+   scheduling every non-release ramp, so no change was needed there — this
+   is recorded as a finding, not left as an unstated assumption.
+5. **Release reworked from a fixed-duration linear ramp to an exponential
+   decay.** `releaseChord` now calls a new `releaseVoice`, which holds the
+   current gain and uses `AudioParam.setTargetAtTime(RELEASE_FLOOR, now,
+   RELEASE_TIME_CONSTANT_SECONDS)` — floor `0.0001`, time constant `0.17s`,
+   oscillators stopped only after the full `RELEASE_SECONDS` (0.85s) tail —
+   instead of `linearRampToValueAtTime` over a fixed duration. A visibly
+   linear ramp reads as a cut regardless of length; an exponential decay
+   reads as settling. A new test asserts the release schedules
+   `setTargetAtTime` toward the floor (preceded by `setValueAtTime`
+   reasserting the pre-release gain) and asserts no `linearRampToValueAtTime`
+   call to 0 exists on that path.
+6. **Corner-detection thresholds restored to conservative values within the
+   user's specified ranges**, per their explicit "do not lower thresholds
+   further" — `DIRECTION_WINDOW_MS` 60→75, `CORNER_CANDIDATE_DEG` 32→40,
+   `CORNER_CANCEL_DEG` 16→20, `CONFIRM_DISTANCE_PX` 14→20, `CONFIRM_TIME_MS`
+   40→55, `CHORD_CHANGE_COOLDOWN_MS` 90→110. All pre-existing
+   discrimination tests (jitter, gentle curve, same-axis reversal, cooldown
+   non-retrigger) re-verified passing at these tighter values — the fix for
+   felt latency lives entirely in item 2 above, not in loosening detection.
+7. **Speed-to-volume rise/fall retuned within the user's specified
+   ranges**: `LEVEL_RISE_SECONDS` 0.05→0.09, `LEVEL_FALL_SECONDS` 0.1→0.18.
+   Confirmed (rather than assumed) that `SPEED_SMOOTHING_MS` (raw-speed EMA)
+   and `DIRECTION_WINDOW_MS` (corner-axis window) were already structurally
+   separate constants — addressing the user's concern about shared
+   smoothing windows by verification, not restructuring, since they were
+   never actually coupled.
+8. **New tests added** covering exactly the items the user's checkpoint
+   asked for: incoming chord audible much faster than outgoing fades;
+   corner-presence floor guarantees a minimum incoming level even after a
+   low-speed dip; exponential-decay release (no linear-to-zero ramp exists);
+   cooldown does not leak across a `reset()` gesture boundary;
+   `setExpression` cancels a previous move's pending ramp before scheduling
+   a new one instead of stacking automation events. All pre-existing tests
+   (straight-line, jitter, reversal, clean 90° corner, cooldown
+   non-retrigger, two well-separated corners, corner-latency-under-150ms,
+   speed-spike clamp, gentle-curve non-burst-fire) unchanged and re-verified
+   passing under the new thresholds.
+
+### Verification status (honest, as of this rework)
+
+- `pnpm check` is green: **9 test files, 90 tests passing** (4 new since the
+  previous tuning pass).
+- **Structurally verified** (not merely asserted): the corner-
+  confirmation→`changeChord()` invocation leg is same-tick (no timers, no
+  framework render cycle in this codebase at all); the dev-only timing
+  instrumentation is fully absent from the production bundle (grepped for
+  both the literal debug string and any `console` reference — zero hits).
+- **Not yet done**: a third real-device listening/gesture pass. Every fix in
+  this section addresses a specific, named complaint from the user's
+  message with a structural cause, not a guessed constant — but per their
+  explicit instruction, none of this is being claimed as *resolved* until
+  they retest the deployed build against the eight gestures they specified
+  (sharp L-shape, gentle continuous curve, small hand jitter, reversal along
+  the same straight axis, slow→fast→slow, release while quiet, release
+  while loud, several rapid intentional corners). Notation/UI work remains
+  explicitly not started, per their instruction not to begin it until this
+  checkpoint passes.

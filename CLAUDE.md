@@ -132,34 +132,72 @@ here and wire it into `check`. Growing this file is the work.
   accumulate — see `spec/audio.test.ts`'s "keeps at most one crossfading-out
   generation alive" test.
 - **Chord lifecycle is pointer-driven, not timed**: `AudioEngine.startChord`
-  (pointer-down, quick attack), `.changeChord` (confirmed corner, ~100ms
-  crossfade between outgoing and incoming chords, started immediately from
-  `context.currentTime` — never a delayed timer), `.releaseChord`
-  (pointer-up, ~400ms release). `.setExpression(level, vibratoIntensity)` is
-  called on every pointer move and only ever touches the *currently
-  sustaining* chord's voices — a chord already fading out keeps its own
-  envelope undisturbed.
-- **Every gain ramp goes through a shared `rampParam` helper, not a bare
-  `linearRampToValueAtTime`.** It reads the AudioParam's current (possibly
-  still-interpolating) value, re-asserts it with `setValueAtTime(current,
-  now)`, then ramps — this is what makes it safe to call repeatedly in quick
-  succession (every pointer move, or a corner landing mid-crossfade) without
-  audible zipper/steps. Do not call `cancelAndHoldAtTime`/
-  `cancelScheduledValues` directly on a voice's gain elsewhere in this file —
-  a bare `cancelScheduledValues` does not reliably hold the in-flight value
-  across browsers, which is exactly what made an earlier version of pointer-
-  release feel abrupt.
+  (pointer-down, quick attack), `.changeChord` (confirmed corner — see below),
+  `.releaseChord` (pointer-up, exponential-decay release — see below).
+  `.setExpression(level, vibratoIntensity)` is called on every pointer move
+  and only ever touches the *currently sustaining* chord's voices — a chord
+  already fading out keeps its own envelope undisturbed.
+- **A confirmed corner does NOT use one shared "crossfade" duration for the
+  incoming and outgoing chords — that was a real bug, not just a constants
+  choice.** The incoming chord ramps in over `INCOMING_ATTACK_SECONDS`
+  (~40ms) while the outgoing one lingers over the separate, longer
+  `OUTGOING_FADE_SECONDS` (~130ms). A single shared ~100ms constant meant the
+  new chord's linear 0→full ramp spent its early portion at low, easily
+  masked amplitude while the still-loud outgoing chord dominated — so the
+  harmony change wasn't perceptually established until close to the full
+  100ms had passed, well after the code had "already" started it. Splitting
+  the two, and biasing the incoming ramp much shorter, is what actually
+  fixes felt latency — tightening `gesture.ts`'s corner-confirmation
+  thresholds further would only have traded discrimination for an illusion
+  of responsiveness, since the corner→`changeChord()` call itself was already
+  same-tick (verified: no React, no `setTimeout`/rAF/Promise anywhere between
+  gesture confirmation and the audio call — this app has no framework at
+  all, `visualization.ts`'s rAF/`setTimeout` only animate a decorative dot
+  *after* audio has already been scheduled).
+- **`changeChord` also guarantees the incoming chord a `CORNER_PRESENCE_FLOOR`
+  (~0.5) minimum level**, regardless of the continuously speed-driven
+  `currentLevel` at that instant. A hand naturally slows down while pivoting
+  through a sharp turn, which can drive the smoothed speed (and thus volume)
+  to its quietest point at exactly the moment a corner fires — without this
+  floor, the new chord could start on time but be nearly inaudible until the
+  hand re-accelerates, which reads as "the change happened late" even though
+  it didn't. This is the structural link between the corner-latency and
+  speed-to-volume-jumpiness complaints reported after the first tuning pass.
+- **Pointer-release now decays exponentially, not linearly.** `releaseChord`
+  calls `releaseVoice`, which holds the chord's current gain and uses
+  `AudioParam.setTargetAtTime(RELEASE_FLOOR, now, RELEASE_TIME_CONSTANT_SECONDS)`
+  (floor `0.0001`, time constant ~170ms, ≈`RELEASE_SECONDS` 850ms total audible
+  tail) instead of a fixed-duration `linearRampToValueAtTime` — a visibly
+  linear ramp reads as a cut no matter how long it's stretched, where an
+  exponential decay reads as an ensemble settling. Oscillators are stopped
+  only once the full `RELEASE_SECONDS` tail has had time to become
+  inaudible, never at the moment the decay is scheduled.
+- **Every linear gain ramp goes through a shared `rampParam` helper** (used
+  for crossfade/steal/expression, never for release — see above). It reads
+  the AudioParam's current (possibly still-interpolating) value, re-asserts
+  it with `setValueAtTime(current, now)`, then ramps — this is what makes it
+  safe to call repeatedly in quick succession (every pointer move, or a
+  corner landing mid-crossfade) without audible zipper/steps. Do not call
+  `cancelAndHoldAtTime`/`cancelScheduledValues` directly on a voice's gain
+  elsewhere in this file — a bare `cancelScheduledValues` does not reliably
+  hold the in-flight value across browsers. `releaseParam` is the equivalent
+  helper for the exponential release path.
 - **Speed-to-volume mapping lives in `audio.ts`'s `speedToLevel`** (a pure,
   directly-tested function): below `SPEED_FLOOR_PX_S` the level is a held
   minimum (never silent while holding still), above `SPEED_CEILING_PX_S` it's
   full volume, linear in between. The resulting level is applied
-  asymmetrically in `setExpression` — a faster ramp (~50ms) when volume is
-  rising than when it's falling (~100ms), since a momentary dip in the
+  asymmetrically in `setExpression` — a faster ramp (~90ms) when volume is
+  rising than when it's falling (~180ms), since a momentary dip in the
   smoothed speed reading otherwise reads as a stutter. `gesture.ts` also
   clamps any single instantaneous speed sample above
   `MAX_INSTANTANEOUS_SPEED_PX_S` before it reaches the EMA, so one
   event-rate/coalescing glitch can't punch a spike through the smoothed
-  speed the volume is driven from.
+  speed the volume is driven from. `SPEED_SMOOTHING_MS` (~80ms, the raw-speed
+  EMA) and `DIRECTION_WINDOW_MS` (~75ms, the corner-axis window) are
+  deliberately separate constants — speed-to-volume and corner detection are
+  different signals with different responsiveness needs, and were never
+  actually coupled, but this is called out explicitly so a future change
+  doesn't accidentally merge them.
 - **Vibrato is one shared LFO oscillator (sine, ~5.5Hz), never stopped once
   created**, fanned out through a per-voice gain node (`vibratoScaleGain`)
   into each oscillator's `detune` AudioParam. `GestureAnalyzer` tracks

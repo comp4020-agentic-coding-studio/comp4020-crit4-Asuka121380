@@ -1,5 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { AudioEngine, MAX_ACTIVE_VOICES, speedToLevel } from "../audio";
+import {
+  AudioEngine,
+  CORNER_PRESENCE_FLOOR,
+  INCOMING_ATTACK_SECONDS,
+  MAX_ACTIVE_VOICES,
+  OUTGOING_FADE_SECONDS,
+  RELEASE_FLOOR,
+  RELEASE_SECONDS,
+  speedToLevel,
+} from "../audio";
 import { buildChordEvent } from "../chordEvent";
 import { voiceChord } from "../voicing";
 
@@ -8,7 +17,7 @@ import { voiceChord } from "../voicing";
 // AudioContext — enough to observe node creation and gain-envelope calls
 // without needing real audio hardware. Real click-free/level/balance checks
 // still need a human listening pass (see PROCESS.md / reflections/crit-4.md).
-type ParamCall = { method: string; value: number; time?: number };
+type ParamCall = { method: string; value: number; time?: number; timeConstant?: number };
 
 class FakeAudioParam {
   value = 0;
@@ -23,8 +32,9 @@ class FakeAudioParam {
     this.calls.push({ method: "linearRampToValueAtTime", value: v, time: t });
     return this;
   }
-  setTargetAtTime(v: number) {
+  setTargetAtTime(v: number, t?: number, timeConstant?: number) {
     this.value = v;
+    this.calls.push({ method: "setTargetAtTime", value: v, time: t, timeConstant });
     return this;
   }
   cancelScheduledValues(t?: number) {
@@ -180,7 +190,7 @@ describe("AudioEngine: sustained pointer-lifecycle voices", () => {
     expect(() => engine.setExpression(0.5, 0.3)).not.toThrow();
   });
 
-  it("on release, preserves the current gain and ramps down instead of jumping to zero", () => {
+  it("on release, preserves the current gain and decays exponentially instead of jumping to zero", () => {
     const engine = new AudioEngine();
     engine.ensureContext();
     engine.startChord(chordEvent("C"));
@@ -193,19 +203,66 @@ describe("AudioEngine: sustained pointer-lifecycle voices", () => {
 
     engine.releaseChord();
 
-    // The ramp must start from the value the chord already had, not 0 — the
-    // last setValueAtTime call before the final ramp-to-zero should re-assert
+    // The decay must start from the value the chord already had, not 0 — the
+    // last setValueAtTime call before the exponential decay should re-assert
     // that same value rather than resetting it.
     const calls = voice.envelopeGain.gain.calls;
-    const rampToZeroIndex = calls.findIndex((c) => c.method === "linearRampToValueAtTime" && c.value === 0);
-    expect(rampToZeroIndex).toBeGreaterThan(0);
-    const precedingSetValue = calls[rampToZeroIndex - 1];
+    const decayIndex = calls.findIndex((c) => c.method === "setTargetAtTime");
+    expect(decayIndex).toBeGreaterThan(0);
+    expect(calls[decayIndex].value).toBeCloseTo(RELEASE_FLOOR);
+    const precedingSetValue = calls[decayIndex - 1];
     expect(precedingSetValue.method).toBe("setValueAtTime");
     expect(precedingSetValue.value).toBeCloseTo(gainBeforeRelease);
 
-    // The oscillator is scheduled to stop later, not stopped immediately.
+    // No abrupt linear ramp-to-zero is scheduled alongside the decay.
+    expect(calls.some((c) => c.method === "linearRampToValueAtTime" && c.value === 0)).toBe(false);
+
+    // The oscillator is scheduled to stop only once the full release tail
+    // has had time to become inaudible, not stopped immediately.
     expect(voice.oscillator.stopScheduledAt).not.toBeNull();
-    expect(voice.oscillator.stopScheduledAt as number).toBeGreaterThan(0);
+    expect(voice.oscillator.stopScheduledAt as number).toBeCloseTo(RELEASE_SECONDS);
+  });
+
+  it("on a confirmed corner, the incoming chord becomes audible much faster than the outgoing chord fades", () => {
+    const engine = new AudioEngine();
+    engine.ensureContext();
+    engine.startChord(chordEvent("C"));
+    engine.changeChord(chordEvent("G"));
+
+    const internals = engine as unknown as {
+      activeVoices: Array<{ role: string; envelopeGain: { gain: FakeAudioParam } }>;
+    };
+    const outgoing = internals.activeVoices.find((v) => v.role === "fading")!;
+    const incoming = internals.activeVoices.find((v) => v.role === "current")!;
+
+    const outgoingRamp = outgoing.envelopeGain.gain.calls.find(
+      (c) => c.method === "linearRampToValueAtTime" && c.value === 0,
+    )!;
+    const incomingRamp = incoming.envelopeGain.gain.calls.find(
+      (c) => c.method === "linearRampToValueAtTime" && c.value > 0,
+    )!;
+
+    expect(incomingRamp.time).toBeCloseTo(INCOMING_ATTACK_SECONDS);
+    expect(outgoingRamp.time).toBeCloseTo(OUTGOING_FADE_SECONDS);
+    // The incoming chord must reach full amplitude well before the outgoing
+    // one has faded out — this is what makes the harmony change read as
+    // immediate rather than gradually crossfading in under the old chord.
+    expect(incomingRamp.time as number).toBeLessThan(outgoingRamp.time as number);
+  });
+
+  it("guarantees the incoming chord a minimum presence even if speed-driven volume had dipped", () => {
+    const engine = new AudioEngine();
+    engine.ensureContext();
+    engine.startChord(chordEvent("C"));
+    // Simulate a hand slowing to a near-stop while pivoting through a corner.
+    engine.setExpression(0.05, 0);
+    engine.changeChord(chordEvent("G"));
+
+    const internals = engine as unknown as {
+      activeVoices: Array<{ role: string; levelGain: { gain: FakeAudioParam } }>;
+    };
+    const incoming = internals.activeVoices.find((v) => v.role === "current")!;
+    expect(incoming.levelGain.gain.value).toBeGreaterThanOrEqual(CORNER_PRESENCE_FLOOR);
   });
 
   it("ramps volume up faster than it ramps volume down", () => {
@@ -229,6 +286,27 @@ describe("AudioEngine: sustained pointer-lifecycle voices", () => {
     // currentTime never advances), so a larger target time means a longer
     // (slower) ramp.
     expect(fallTarget).toBeGreaterThan(riseTarget);
+  });
+
+  it("cancels a previous move's still-pending ramp instead of stacking automation events", () => {
+    const engine = new AudioEngine();
+    engine.ensureContext();
+    engine.startChord(chordEvent("C"));
+    const internals = engine as unknown as {
+      activeVoices: Array<{ levelGain: { gain: FakeAudioParam } }>;
+    };
+    const [voice] = internals.activeVoices;
+
+    engine.setExpression(0.4, 0);
+    engine.setExpression(0.9, 0);
+
+    // Every ramp after the first must be preceded by a cancel, so rapid
+    // successive pointer moves replace the in-flight automation rather than
+    // layering a second ramp on top of one still interpolating.
+    const calls = voice.levelGain.gain.calls;
+    const secondRampIndex = calls.map((c) => c.method).lastIndexOf("linearRampToValueAtTime");
+    const priorCalls = calls.slice(0, secondRampIndex);
+    expect(priorCalls.some((c) => c.method === "cancelScheduledValues")).toBe(true);
   });
 });
 

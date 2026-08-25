@@ -13,19 +13,41 @@ const MASTER_HIGHPASS_HZ = 36;
 
 const ATTACK_SECONDS = 0.05;
 // A confirmed corner starts the new chord immediately (from
-// `context.currentTime`, never a delayed timer) and crossfades the outgoing
-// chord out over this same window.
-const CROSSFADE_SECONDS = 0.1;
-// Pointer-up preserves whatever gain the chord was already at and fades to
-// silence over this window before the oscillators are stopped/disconnected —
-// never a direct-to-zero cut.
-const RELEASE_SECONDS = 0.4;
+// `context.currentTime`, never a delayed timer). The incoming and outgoing
+// voices deliberately do NOT share one "crossfade" duration any more: making
+// the incoming chord audible fast is what makes a corner feel immediate;
+// how long the outgoing chord lingers is a separate, purely cosmetic tail
+// that can be slower without costing any felt latency. Conflating the two
+// (one shared ~100ms constant) was a root cause of "the audible chord still
+// changes noticeably later than confirmation" — a linear ramp from 0 spends
+// most of its early portion at low, easily-masked amplitude, so with a
+// 100ms attack the incoming chord wasn't perceptually dominant until close
+// to the full 100ms had elapsed, by which point the still-loud outgoing
+// chord had been masking it the whole time.
+export const INCOMING_ATTACK_SECONDS = 0.04;
+export const OUTGOING_FADE_SECONDS = 0.13;
+// A confirmed corner is, by definition, a deliberate gesture — but a hand
+// physically slows down while pivoting through a sharp turn, which can drive
+// the continuously speed-driven volume level to its quietest point at
+// exactly the moment the new chord starts. Left alone, that starves the new
+// chord of the very presence that's supposed to announce the corner, and
+// reads as "the change happened late" even though it started on time. This
+// floor guarantees the incoming chord is never quieter than a clearly
+// audible presence at the moment it's created; ordinary speed-driven
+// `setExpression` calls immediately continue adjusting it from there.
+export const CORNER_PRESENCE_FLOOR = 0.5;
+// Pointer-up preserves whatever gain the chord was already at and decays
+// exponentially toward near-silence — a natural "ensemble settling" tail,
+// not a linear cut — before the oscillators are stopped/disconnected.
+export const RELEASE_SECONDS = 0.85;
+export const RELEASE_TIME_CONSTANT_SECONDS = 0.17; // ~5 time constants ≈ RELEASE_SECONDS
+export const RELEASE_FLOOR = 0.0001; // exponential decay can only approach 0, never reach it
 const STEAL_FADE_SECONDS = 0.03;
 // Continuous speed-to-volume response is asymmetric: quicker to rise (a
 // sudden increase in speed should be heard right away) than to fall (so a
 // momentary dip in the smoothed speed doesn't read as a stutter).
-const LEVEL_RISE_SECONDS = 0.05;
-const LEVEL_FALL_SECONDS = 0.1;
+const LEVEL_RISE_SECONDS = 0.09;
+const LEVEL_FALL_SECONDS = 0.18;
 const EXPRESSION_SMOOTHING_SECONDS = 0.06;
 const VIBRATO_RATE_HZ = 5.5;
 
@@ -98,6 +120,19 @@ function rampParam(param: AudioParam, value: number, now: number, targetTime: nu
   param.cancelScheduledValues(now);
   param.setValueAtTime(current, now);
   param.linearRampToValueAtTime(value, targetTime);
+}
+
+/** Same safe cancel-then-reassert pattern as `rampParam`, but decays
+ *  exponentially toward `floor` instead of linearly to an exact target —
+ *  used for pointer-release, where a natural decaying tail (not a visibly
+ *  linear cut) is the point. `setTargetAtTime` only approaches `floor`
+ *  asymptotically; the caller schedules cleanup a fixed time later rather
+ *  than waiting for an exact-equality target that will never arrive. */
+function releaseParam(param: AudioParam, floor: number, now: number, timeConstant: number): void {
+  const current = param.value;
+  param.cancelScheduledValues(now);
+  param.setValueAtTime(current, now);
+  param.setTargetAtTime(floor, now, timeConstant);
 }
 
 type VoiceRole = "current" | "fading";
@@ -179,8 +214,13 @@ export class AudioEngine {
   }
 
   /** Crossfades from the currently-sustaining chord to a new one (a
-   *  confirmed corner). The outgoing chord fades out over the same window
-   *  the incoming one fades in, so the two overlap rather than cutting. */
+   *  confirmed corner). The incoming chord is made audible fast
+   *  (INCOMING_ATTACK_SECONDS) while the outgoing chord lingers longer
+   *  (OUTGOING_FADE_SECONDS) — the two durations are deliberately different,
+   *  not one shared "crossfade" window (see the constants' comments). The
+   *  incoming chord also gets a guaranteed presence floor so a momentary dip
+   *  in speed-driven volume right at the turn can't silence the very thing
+   *  announcing the corner. */
   changeChord(event: ChordEvent): void {
     if (!this.context || !this.masterHighpass) return;
     if (this.activeVoices.every((v) => v.role !== "current")) {
@@ -188,16 +228,18 @@ export class AudioEngine {
       return;
     }
     for (const voice of this.activeVoices.filter((v) => v.role === "current")) {
-      this.fadeOutVoice(voice, CROSSFADE_SECONDS);
+      this.fadeOutVoice(voice, OUTGOING_FADE_SECONDS);
     }
     const preset = presetFor(event.ensemble);
-    for (const note of event.notes) this.createVoice(note, preset, CROSSFADE_SECONDS);
+    const incomingLevel = Math.max(this.currentLevel, CORNER_PRESENCE_FLOOR);
+    for (const note of event.notes) this.createVoice(note, preset, INCOMING_ATTACK_SECONDS, incomingLevel);
   }
 
-  /** Releases the held chord (pointer-up). */
+  /** Releases the held chord (pointer-up): an exponential decay toward
+   *  near-silence, not a linear fade — see `releaseVoice`. */
   releaseChord(): void {
     for (const voice of this.activeVoices.filter((v) => v.role === "current")) {
-      this.fadeOutVoice(voice, RELEASE_SECONDS);
+      this.releaseVoice(voice);
     }
   }
 
@@ -225,7 +267,7 @@ export class AudioEngine {
     }
   }
 
-  private createVoice(note: VoicedNote, preset: Preset, attackSeconds: number): void {
+  private createVoice(note: VoicedNote, preset: Preset, attackSeconds: number, levelOverride?: number): void {
     const context = this.context;
     const masterHighpass = this.masterHighpass;
     if (!context || !masterHighpass) return;
@@ -243,7 +285,7 @@ export class AudioEngine {
     filter.Q.value = preset.filterQ;
 
     const levelGain = context.createGain();
-    levelGain.gain.value = this.currentLevel;
+    levelGain.gain.value = levelOverride ?? this.currentLevel;
 
     const envelopeGain = context.createGain();
     envelopeGain.gain.setValueAtTime(0, now);
@@ -286,6 +328,37 @@ export class AudioEngine {
     rampParam(voice.envelopeGain.gain, 0, now, now + fadeSeconds);
 
     const stopAt = now + fadeSeconds + 0.02;
+    try {
+      voice.oscillator.stop(stopAt);
+    } catch {
+      // already scheduled to stop — nothing to do.
+    }
+
+    const cleanup = () => {
+      voice.envelopeGain.disconnect();
+      voice.filter.disconnect();
+      voice.levelGain.disconnect();
+      voice.vibratoScaleGain.disconnect();
+      this.activeVoices = this.activeVoices.filter((v) => v !== voice);
+    };
+    voice.oscillator.addEventListener("ended", cleanup, { once: true });
+  }
+
+  /** Pointer-up release: an exponential decay toward near-silence, holding
+   *  from whatever gain the chord was already at — a natural "settling" tail
+   *  rather than the visibly linear cut a fixed-duration `linearRampToValueAtTime`
+   *  produces. Cleanup (stop/disconnect) is scheduled only once the decay has
+   *  had the full RELEASE_SECONDS to become inaudible, not the moment the
+   *  ramp is scheduled. */
+  private releaseVoice(voice: ActiveVoice): void {
+    const context = this.context;
+    if (!context) return;
+    voice.role = "fading";
+
+    const now = context.currentTime;
+    releaseParam(voice.envelopeGain.gain, RELEASE_FLOOR, now, RELEASE_TIME_CONSTANT_SECONDS);
+
+    const stopAt = now + RELEASE_SECONDS;
     try {
       voice.oscillator.stop(stopAt);
     } catch {
