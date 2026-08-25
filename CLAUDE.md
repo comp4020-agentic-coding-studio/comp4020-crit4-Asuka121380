@@ -43,10 +43,18 @@ here and wire it into `check`. Growing this file is the work.
 
 ## Facts about this stack that keep coming up
 
-- **No `.ts` extension in relative imports.** This repo's `tsconfig.json` does
-  not set `allowImportingTsExtensions`, so `import { x } from "./content.ts"`
-  fails typecheck with `TS5097`. Write `from "./content"`; Vite resolves it
-  fine.
+- **`.ts` extensions in relative imports are allowed but not used here.**
+  This repo's `tsconfig.json` sets `allowImportingTsExtensions: true` (a prior
+  week's carried-forward note claimed the opposite — that was wrong for this
+  checkout). Both `from "./harmony"` and `from "./harmony.ts"` typecheck; this
+  project writes extensionless imports for consistency with Vite's own
+  resolution, not because the extension is rejected.
+- **All app modules live at the repo root, not under `src/`.**
+  `tsconfig.json`'s `include` is `["*.ts", "spec", "scripts"]` — a bare `*.ts`
+  glob matches only root-level files, not a subdirectory. Adding a `src/`
+  folder would silently drop those files from typecheck. `main.ts` and every
+  module it imports (`harmony.ts`, `voicing.ts`, `chordEvent.ts`, `audio.ts`,
+  `interaction.ts`, `visualization.ts`, `rng.ts`) stay flat at the root.
 - **`stylelint-config-standard` rejects BEM naming.** Its default
   `selector-class-pattern` is strict kebab-case (`^[a-z]([-a-z0-9]+)?$`), so
   `__element` and `--modifier` class names (e.g. `.tile__art`,
@@ -93,3 +101,40 @@ here and wire it into `check`. Growing this file is the work.
 - **Construct `AudioContext` only inside an explicit user-gesture handler.**
   Browsers block autoplay; building the context earlier either throws or
   leaves it suspended.
+
+## The Living Score (Crit 4 instrument)
+
+- **Architecture**: `harmony.ts` (Markov transition + chord-colour sampling,
+  seeded via `rng.ts`'s `mulberry32`) → `voicing.ts` (fixed four-part voicing
+  table, pitch-name-to-MIDI, per-ensemble instrument names) → `chordEvent.ts`
+  (the single `ChordEvent` record) → `audio.ts` (`AudioEngine`: oscillator +
+  biquad-lowpass filter + gain per voice, routed through one master gain) and
+  `visualization.ts` (`ChordVisualizer`: chord symbol + four fading gold note
+  markers) both driven from the same `ChordEvent`. `interaction.ts`
+  (`ConductingController`) turns pointer/touch/keyboard input into
+  `onChordTrigger` calls via accumulated-distance threshold crossing.
+  `main.ts` wires it all to the DOM.
+- **Polyphony cap is 16 active single-note voices** (`MAX_ACTIVE_VOICES` in
+  `audio.ts`) — four per chord, room for a few overlapping chords during fast
+  conducting before the oldest voice is stolen (faded over 30ms, then
+  stopped) rather than letting the graph grow unbounded. Stolen voices are
+  removed from the bookkeeping pool immediately (not left waiting for the
+  browser's `ended` event), or rapid conducting can still exceed the cap
+  before cleanup catches up.
+- **Master gain is clamped to 0.2**, peak per-voice gain 0.22 — chosen and
+  checked on this machine's laptop speakers/headphones only. **A real-phone
+  listening pass has not yet been done** — do not treat this level as
+  confirmed safe until that happens (see `PROCESS.md`/`reflections/crit-4.md`
+  for current verification status).
+- **Keyboard conducting simulates movement on a steady 60ms tick** while
+  Space is held (`interaction.ts`'s `startKeyboardConducting`), feeding the
+  same distance-accumulation/threshold path as pointer movement, rather than
+  triggering on its own separate timer. Arrow keys move the baton indicator
+  only; they never trigger a chord.
+- **Distance threshold is 55px** (`DISTANCE_THRESHOLD_PX`) before one chord
+  triggers and the accumulator resets.
+- **Symphonic Strings preset exists in `audio.ts` and is reachable via the
+  ensemble toggle / `E` key, but is untested by ear.** Brass Choir is the only
+  ensemble that has been listened to and is confirmed as the safety-net MVP
+  per the build brief; Strings should not be presented as verified until a
+  human listening pass covers it too.

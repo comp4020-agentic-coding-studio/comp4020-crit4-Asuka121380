@@ -3,17 +3,12 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>COMP4020 prototype</title>
+    <title>The Living Score</title>
     <meta
       name="description"
-      content="Replace this with one sentence saying what this page is. A search result and a link preview both show it."
+      content="Conduct an invisible ensemble with mouse, touch, or keyboard — a living harmony system chooses each chord as you move."
     />
 
-    <!--
-      The link-preview card: public/card.png, 1200x630 --- replace it. The URL
-      resolves against this page, like any link. No og:title/og:description:
-      scrapers fall back to the <title> and description above.
-    -->
     <meta property="og:type" content="website" />
     <meta property="og:image" content="./card.png" />
     <meta name="twitter:card" content="summary_large_image" />
@@ -23,14 +18,52 @@
   <body>
     <header>
       <nav aria-label="Primary">
-        <a href="./">Home</a>
+        <a href="./">The Living Score</a>
       </nav>
     </header>
     <main>
-      <h1>COMP4020 prototype</h1>
-      <p data-testid="intro">
-        Replace this with your prototype. This week's brief is on the course website;
-        <code>spec/README.md</code> explains how the checks in this repo relate to it.
+      <h1>The Living Score</h1>
+
+      <div class="controls">
+        <button type="button" id="ensemble-toggle" aria-pressed="false">Brass Choir</button>
+        <button type="button" id="reset-button">Clear</button>
+      </div>
+
+      <p id="status" class="visually-hidden" role="status" aria-live="polite"></p>
+
+      <section
+        class="score"
+        id="conducting-surface"
+        tabindex="0"
+        aria-label="Conducting surface. Press and move, or hold Space, to conduct."
+      >
+        <div class="chord-symbol" id="chord-symbol" aria-hidden="true"></div>
+
+        <div class="instrument-row" data-voice="soprano">
+          <span class="instrument-label">Trumpet / Violin</span>
+          <div class="note-lane" id="lane-soprano"></div>
+        </div>
+        <div class="instrument-row" data-voice="alto">
+          <span class="instrument-label">Horn / Viola</span>
+          <div class="note-lane" id="lane-alto"></div>
+        </div>
+        <div class="instrument-row" data-voice="tenor">
+          <span class="instrument-label">Trombone / Cello</span>
+          <div class="note-lane" id="lane-tenor"></div>
+        </div>
+        <div class="instrument-row" data-voice="bass">
+          <span class="instrument-label">Tuba / Double Bass</span>
+          <div class="note-lane" id="lane-bass"></div>
+        </div>
+
+        <p class="concert-pitch-label">Concert pitch</p>
+        <div class="baton" id="baton" aria-hidden="true"></div>
+        <p class="invitation" id="invitation">Hold and conduct.</p>
+      </section>
+
+      <p class="keyboard-hint">
+        Arrow keys move the baton. Hold Space to conduct. <kbd>E</kbd> switches ensemble,
+        <kbd>R</kbd> resets the harmony.
       </p>
     </main>
     <script type="module" src="./main.ts"></script>

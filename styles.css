@@ -1,16 +1,266 @@
+:root {
+  --ivory: #f4ecdc;
+  --staff-line: #9c8f78;
+  --ink: #1e2430;
+  --gold: #b8923f;
+  --gold-bright: #e0b04f;
+}
+
+* {
+  box-sizing: border-box;
+}
+
 body {
   margin: 0;
-  padding: 2rem;
-  font-family: system-ui, sans-serif;
+  padding: 0;
+  font-family: "Iowan Old Style", "Palatino Linotype", Georgia, serif;
   line-height: 1.6;
-  color: #1a1a1a;
+  color: var(--ink);
+  background: var(--ivory);
 }
 
 main {
-  max-width: 40rem;
+  max-width: 48rem;
   margin: 0 auto;
+  padding: 1.5rem 1.25rem 3rem;
+}
+
+header {
+  padding: 0.75rem 1.25rem;
+  border-bottom: 1px solid var(--staff-line);
 }
 
 a {
-  color: #0b5fff;
+  color: var(--ink);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+a:focus-visible {
+  outline: 2px solid var(--gold);
+  outline-offset: 2px;
+}
+
+h1 {
+  font-size: 1.9rem;
+  letter-spacing: 0.03em;
+  text-align: center;
+  margin: 0.5rem 0 1.25rem;
+}
+
+.controls {
+  display: flex;
+  justify-content: center;
+  gap: 0.75rem;
+  margin-bottom: 1.5rem;
+}
+
+.controls button {
+  min-height: 44px;
+  min-width: 44px;
+  padding: 0.5rem 1.1rem;
+  font: inherit;
+  font-weight: 600;
+  color: var(--ink);
+  background: transparent;
+  border: 1px solid var(--staff-line);
+  border-radius: 999px;
+  cursor: pointer;
+}
+
+.controls button:hover {
+  border-color: var(--gold);
+}
+
+.controls button:focus-visible {
+  outline: 2px solid var(--gold);
+  outline-offset: 2px;
+}
+
+.controls button[aria-pressed="true"] {
+  background: var(--gold);
+  border-color: var(--gold);
+  color: var(--ivory);
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.score {
+  position: relative;
+  touch-action: none;
+  user-select: none;
+  border: 1px solid var(--staff-line);
+  border-radius: 0.75rem;
+  padding: 2.5rem 1.5rem 3.5rem;
+  background: linear-gradient(180deg, rgba(184, 146, 63, 0.04), rgba(184, 146, 63, 0));
+  cursor: grab;
+}
+
+.score:focus-visible {
+  outline: 2px solid var(--gold);
+  outline-offset: 4px;
+}
+
+.chord-symbol {
+  position: absolute;
+  top: 0.75rem;
+  right: 1.25rem;
+  font-size: 1.6rem;
+  font-weight: 600;
+  color: var(--gold);
+  opacity: 0;
+  min-height: 1.6em;
+}
+
+.chord-symbol-pulse {
+  animation: chord-symbol-pulse-in 0.25s ease-out forwards;
+}
+
+@keyframes chord-symbol-pulse-in {
+  from {
+    opacity: 0;
+    transform: translateY(-0.2em);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.instrument-row {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 1.1rem 0;
+  border-bottom: 1px solid var(--staff-line);
+}
+
+.instrument-row:last-of-type {
+  border-bottom: none;
+}
+
+.instrument-label {
+  flex: 0 0 9rem;
+  font-size: 0.85rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--staff-line);
+}
+
+.note-lane {
+  position: relative;
+  flex: 1;
+  height: 1.5rem;
+}
+
+.note-marker {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 1.1rem;
+  height: 1.1rem;
+  border-radius: 50%;
+  background: var(--gold-bright);
+  box-shadow: 0 0 0.6rem var(--gold-bright);
+  transform: translate(-50%, -50%);
+  opacity: 0;
+}
+
+.note-marker-active {
+  opacity: 1;
+  transition: opacity 0.08s ease-in;
+}
+
+.note-marker-fading {
+  opacity: 0;
+  transition: opacity var(--fade-seconds, 1.3s) ease-out;
+}
+
+.concert-pitch-label {
+  text-align: center;
+  font-size: 0.75rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--staff-line);
+  margin: 1.25rem 0 0;
+}
+
+.baton {
+  position: absolute;
+  top: var(--baton-y, 50%);
+  left: var(--baton-x, 50%);
+  width: 0.6rem;
+  height: 0.6rem;
+  margin: -0.3rem 0 0 -0.3rem;
+  border-radius: 50%;
+  background: var(--gold-bright);
+  box-shadow: 0 0 0.8rem var(--gold-bright);
+  pointer-events: none;
+}
+
+.invitation {
+  position: absolute;
+  bottom: 1rem;
+  left: 0;
+  right: 0;
+  text-align: center;
+  font-style: italic;
+  color: var(--staff-line);
+  margin: 0;
+  transition: opacity 0.4s ease-out;
+}
+
+.invitation-hidden {
+  opacity: 0;
+}
+
+.keyboard-hint {
+  text-align: center;
+  font-size: 0.85rem;
+  color: var(--staff-line);
+  margin-top: 1rem;
+}
+
+kbd {
+  font: inherit;
+  border: 1px solid var(--staff-line);
+  border-radius: 0.25rem;
+  padding: 0 0.3rem;
+}
+
+@media (width <= 780px) {
+  main {
+    padding: 1rem 0.75rem 2.5rem;
+  }
+
+  .instrument-label {
+    flex-basis: 6rem;
+    font-size: 0.7rem;
+  }
+
+  .score {
+    padding: 2.25rem 1rem 3rem;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chord-symbol-pulse {
+    animation: none;
+    opacity: 1;
+  }
+
+  .invitation {
+    transition: none;
+  }
 }

@@ -1,85 +1,65 @@
 # Process overview
 
-<!-- TEMPLATE: this file is a shape to fill in, not a form. Replace everything
-     in it with your own overview, and delete this comment — `pnpm
-     check:evidence` will remind you if it's still here. -->
-
-A reading-guide to how the work came together --- a map to your process, not an
-essay about it. Markers read this file and follow its citations; they don't
-trawl the repo for evidence you didn't point at, so if a moment mattered, cite
-it.
-
-This file is the shape; the course site's
-[assessment page](https://comp.anu.edu.au/courses/comp4020-agentic-coding-studio/topics/assessment/#what-you-submit)
-is the requirement, and its
-[word counts](https://comp.anu.edu.au/courses/comp4020-agentic-coding-studio/topics/assessment/#word-counts)
-cover every deliverable.
+A reading-guide to how the work came together, following
+`C4_MVP_BUILD_PROMPT.md`'s scope and build order.
 
 ## What I built
 
-One paragraph: the thing, and the idea behind it.
+The Living Score: a browser instrument where conducting an invisible ensemble
+with mouse, touch, or keyboard triggers chords chosen by a small Markov
+harmony system, voiced by a fixed four-part table, and briefly rendered as a
+glowing chord symbol and four fading gold note-markers on a transient,
+non-persistent score.
 
 ## The moments that mattered
 
-Three or four for an assignment; fewer is fine for a weekly prototype. Keep the
-list short so each moment has room to do all four jobs:
+1. **The core signal chain landed as one vertical slice, not stage-by-stage.**
+   Rather than building a placeholder chord first and wiring harmony/voicing
+   in later, I wrote the whole pipeline in one pass — `harmony.ts` (Markov
+   transitions + chord-colour sampling, derived from the corpus rather than
+   hand-copied from the published percentage table) through `voicing.ts`
+   (fixed table, pitch-name-to-MIDI), `audio.ts` (Brass Choir synthesis with
+   a capped, voice-stealing polyphony pool), and `visualization.ts` (the
+   transient chord animation), all sharing one `ChordEvent`. I checked this
+   was right by writing the harmony tests against the *published* transition
+   table (section 7) as a fixture, not as the implementation itself — every
+   state's derived probabilities matched within rounding tolerance, and a
+   dedicated test asserts `IV` and `iv` are never confused.
+   ([`ed0b907`](https://github.com/comp4020-agentic-coding-studio/comp4020-crit4-Asuka121380/commit/ed0b907))
+2. **The polyphony cap didn't actually cap anything on the first pass.**
+   `stealOldestIfAtCap` marked the oldest voice `stopped` but left it in the
+   `activeVoices` array until the browser's `ended` event fired later, so
+   under rapid triggering (four notes per chord, many chords per second) the
+   pool grew past the documented limit before cleanup caught up. A test that
+   fires 30 chords through a fake `AudioContext` and asserts the pool never
+   exceeds `MAX_ACTIVE_VOICES` caught this immediately (`20` active voices
+   against a cap of `16`) — the fix was to remove the stolen voice from the
+   bookkeeping array the instant it's stolen, not wait for `ended`. Recorded
+   as a fact in `CLAUDE.md` so a later session doesn't reintroduce it.
+   ([`ed0b907`](https://github.com/comp4020-agentic-coding-studio/comp4020-crit4-Asuka121380/commit/ed0b907))
+3. **`CLAUDE.md` carried a wrong fact forward.** It claimed this repo's
+   `tsconfig.json` rejects `.ts` extensions in imports; reading the actual
+   file showed `allowImportingTsExtensions: true`. Corrected the note rather
+   than silently working around it, and added a fact about `include`'s bare
+   `*.ts` glob only matching root-level files (so every module stays flat at
+   the repo root, not under `src/`) before it could cause a confusing
+   "file not typechecked" surprise later.
+   ([`ed0b907`](https://github.com/comp4020-agentic-coding-studio/comp4020-crit4-Asuka121380/commit/ed0b907))
 
-1. **what happened** --- the problem, or the thing that went wrong
-2. **what you did instead of the obvious thing** --- the call you made, and why
-   it beat the obvious one
-3. **how you knew it was right** --- the check you ran, the viewport you looked
-   at, what you read before accepting the diff
-4. **the citation** --- a commit or commit range, a `CLAUDE.md` change, a check
-   that went from red to green, a prompt paired with the commit it produced
+## Verification status (honest, as of this commit)
 
-Jobs 2 and 3 are the ones the repo can't tell a reader on its own, so they're
-where the marks are. The strongest moments are the ones where a correction
-landed in the **harness** --- the standards and checks your work has to satisfy
---- rather than in a retry: a rule added to `CLAUDE.md`, a check wired up, an
-attempt thrown away. Retrying until it passes is the routine case, and changing
-what the work runs against is the skilled one.
-
-Cite each moment as a link whose text is the commit hash or range and whose
-target is this repo's commit or compare URL, so a reader clicks straight to the
-evidence:
-
-- one commit: [`a1b2c3d`](https://github.com/YOUR-ORG/YOUR-REPO/commit/a1b2c3d)
-- a range:
-  [`a1b2c3d...e4f5a6b`](https://github.com/YOUR-ORG/YOUR-REPO/compare/a1b2c3d...e4f5a6b)
-
-To pair a prompt with the commit it produced, quote the prompt (curated, not a
-full transcript) next to the citation:
-
-> the prompt, verbatim
-
-Screenshots are welcome where one carries the verification better than a
-sentence does. Commit the file to this repo and link it with a **relative**
-path, which is what makes it render on GitHub: `![alt text](docs/before.png)`.
-Images don't count towards the word count and don't replace the citation.
-
-### A worked moment, for shape
-
-Delete this section along with the rest of the boilerplate --- it's here to show
-the four jobs in one paragraph, not to be imitated in content.
-
-> The date formatter kept coming back with `toLocaleDateString()` and no locale
-> argument, so the same build rendered differently on my machine and in CI. I'd
-> already re-prompted it twice, which fixed the line but not the habit, so the
-> third time I put the rule in `CLAUDE.md` instead
-> ([`3f9ac21`](https://github.com/YOUR-ORG/YOUR-REPO/commit/3f9ac21)) and added
-> a spec test that fails on a bare `toLocaleDateString`. That's what told me it
-> had actually taken: the test went red against the old code and green against
-> the new, and the next two features it wrote passed it without prompting
-> ([`3f9ac21...b7e0d14`](https://github.com/YOUR-ORG/YOUR-REPO/compare/3f9ac21...b7e0d14)).
-
-## Before you ship
-
-`pnpm check:evidence` verifies your citations resolve to real commits, that a
-reflection entry the marker reads is in `reflections/`, and that your
-`CLAUDE.md` is there --- before a marker ever opens the file. It checks that
-your map is traceable, not that it is good: the marker judges whether your
-small, deliberately chosen set of moments shows real judgement and reflection. A
-green check is not a substitute for that curation.
-
-Images aren't checked: whether one renders is visible the moment you look. Open
-this file on GitHub and look at it before you ship.
+- `pnpm check` is green: 57 tests pass, including the pre-existing crit-4
+  contract tests (Web Audio synthesis present, no `<audio>`/`<video>`
+  fallback, pointer *and* keyboard input both wired) and the invariants.
+- **Not yet done**: any real-browser interaction test (dragging, the actual
+  sound, click-free envelope confirmation by ear), any mobile/touch device
+  test, any viewport check at 1920×1080 or 390×844, and deployment. These
+  require a real browser and, for the mobile checks, a physical phone —
+  outside what this environment can do. `pnpm preview` was used only to
+  confirm the built page serves valid markup; no audio or gesture behaviour
+  has been observed running.
+- Symphonic Strings is implemented (reachable via the `E` key / ensemble
+  toggle) but has not been listened to — Brass Choir is the only ensemble
+  currently claimed as working.
+- Next: get a human (device + ears) to confirm first-gesture sound, then
+  deploy the Brass-only safety-net version per section 16 step 8.
