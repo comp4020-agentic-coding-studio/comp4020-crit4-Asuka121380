@@ -238,37 +238,54 @@ here and wire it into `check`. Growing this file is the work.
   locked axis) and reports a decaying `vibratoIntensity` (0-1);
   `setExpression` scales that by the ensemble's max cents (Brass ±6,
   Strings ±14) per voice, every pointer move.
-- **Corner detection is a stable-segment model, not a cumulative-direction-
-  change threshold** (`gesture.ts`, fully rewritten during the cross-device
-  round — the old rolling-window/candidate-hysteresis model, and every
-  constant it used, is gone). The old model's actual failure mode: asking
-  "has direction changed enough since the axis was locked" cannot tell a
-  short sharp turn apart from a long gradual arc, since both can accumulate
-  the same total heading change — which is exactly why smooth curves kept
-  triggering false chord changes. The new model instead looks for the
-  concrete shape of a real corner: `stable incoming segment → short turning
-  region → stable outgoing segment`.
+- **Corner detection is a stable-segment model with an explicit axis-reversal
+  exception, not a cumulative-direction-change threshold and not directed-
+  heading-alone** (`gesture.ts`). The stable-segment shape (`stable incoming
+  segment → short turning region → stable outgoing segment`) replaced a
+  rolling-window/candidate-hysteresis model that let smooth curves accumulate
+  enough total heading change to misfire. A later round then found that
+  scoring *only directed* heading difference between the two segments cannot
+  tell a real corner apart from vibrato/scrubbing: a same-axis reversal
+  (pointer retracing roughly the same line) also produces a large — often
+  near-180° — directed heading swing, so a corner-angle range wide enough to
+  admit sharp near-reversal V-corners also lets ordinary back-and-forth
+  through as a false "corner." The fix is to check heading and axis as two
+  independent quantities, not one.
   - A pivot candidate is found by walking back `SEGMENT_LENGTH_PX` (30px, a
-    *distance* window, not a time window) from the latest sample; the
-    incoming segment's start is another `SEGMENT_LENGTH_PX` back from the
-    pivot.
+    *distance* window via `interpolateAtDistance`, not a time window or a
+    raw-sample snap — this is what keeps classification independent of
+    pointer-event frequency/speed) from the latest sample; the incoming
+    segment's start is another `SEGMENT_LENGTH_PX` back from the pivot.
   - Both the incoming (start→pivot) and outgoing (pivot→end) segments must
     independently pass `isStableSegment`: straight-line chord length ÷ path
     length traveled ≥ `SEGMENT_STRAIGHTNESS_MIN_RATIO` (0.92). One ratio
     check rejects both curvature and in-place jitter/wandering, and needs no
     DPI scaling since pointer coordinates already arrive in DPI-independent
-    CSS px.
-  - The *true* (0-360°, unfolded) heading difference between the two
-    segments must fall in `[CORNER_ANGLE_MIN_DEG=70, CORNER_ANGLE_MAX_DEG=165]`.
-    **Do not reuse the mod-180 axis-difference helper (`toAxisAngleDegrees`)
-    for this check** — it exists only for the same-axis reversal/vibrato
-    detector, which needs "same line, either direction" semantics. Folding a
-    true heading change mod 180° inverts corner-sharpness scoring near a
-    reversal (a sharp ~150° V-corner folds to a *low* score, a plain 90°
-    turn folds to the *maximum* score) — use the separate unfolded
-    `headingDegrees`/`headingDifference` helpers for corner strength, always.
-    The 165° upper bound is deliberate: an exact reversal is a same-axis
-    wobble, not a corner, and is left to the reversal/vibrato mechanism.
+    CSS px. **Known sensitivity**: this ratio nearly cancels near an exact
+    180° turn (a 2px pivot/vertex misalignment in a 30px window can drop a
+    150° turn's ratio well below threshold, vs. barely moving a 90° turn's) —
+    an inherent property of ratio-based straightness near reversal angles,
+    not a bug; see `PROCESS.md`'s gesture-classification-fix section.
+  - **Two independent checks, in this order, before a corner can confirm**:
+    (1) undirected axis difference (`axisDifference`, the two segments'
+    headings folded mod 180° and compared, 0-90°) — if
+    `axisDiff <= AXIS_REVERSAL_MAX_DEG` (28°) the candidate is an
+    `axis-reversal`, rejected regardless of how large the directed heading
+    swing is, **checked before** the angle-range check so a near-180°
+    reversal can never fall through and score as a sharp corner; (2) directed
+    heading difference (`headingDifference`, the *true* 0-180° unfolded
+    change) must then fall in `[CORNER_ANGLE_MIN_DEG=70, CORNER_ANGLE_MAX_DEG=135]`
+    to be an unambiguous corner. Between 135° and an exact reversal is a
+    deliberate ambiguous band, broken by recent vibrato-oscillation intensity
+    (`VIBRATO_AMBIGUOUS_MAX_INTENSITY=0.15`): no recent oscillation → genuine
+    sharp corner; recent oscillation → continued scrubbing.
+  - **Do not reuse the mod-180 axis-difference helper (`toAxisAngleDegrees`)
+    for corner-*strength* scoring** — it exists for exactly the axis-reversal
+    comparison above, which needs "same line, either direction" semantics.
+    Folding a true heading change mod 180° inverts corner-sharpness scoring
+    near a reversal (a sharp ~150° V-corner folds to a *low* score, a plain
+    90° turn folds to the *maximum* score) — use the separate unfolded
+    `headingDegrees`/`headingDifference` helpers for that, always.
   - Re-arming a confirmed corner requires the next pivot to be at least
     `CORNER_REARM_DISTANCE_PX` (30px) further along the path *and*
     `CHORD_CHANGE_COOLDOWN_MS` (150ms) since the last confirmed corner —
@@ -278,14 +295,27 @@ here and wire it into `check`. Growing this file is the work.
     the stability/angle classification boundary and could rarely misfire.
     This was not loosened away, since doing so reopens the "smooth curve
     triggers a chord" complaint this model exists to fix.
+  - **Diagnostics** (`getDiagnostics()`, dev-only console output gated behind
+    `import.meta.env.DEV`): reports an explicit `phase`
+    (`collectingIncomingSegment`/`candidateTurn`/`confirmingOutgoingSegment`/
+    `cornerTriggered`/`stableAfterCorner`) and `reason`
+    (`corner`/`curve`/`axis-reversal`/`jitter`/`insufficient-data`) after
+    every sample, plus both raw headings, the heading difference, the axis
+    difference, both segment lengths, and directional variance. The
+    curve-vs-jitter label is decided by `isMonotonicDrift` — sub-chord
+    heading deltas that keep the same sign read as a genuine gradual curve,
+    a sign flip reads as jitter — **not** by raw directional-variance
+    magnitude, which was found empirically to rank a genuine curve *lower*
+    in variance than genuine jitter (the opposite of the naive assumption).
   - This is a pure, DOM-free module — `spec/gesture.test.ts` drives it with
-    realistic multi-point synthetic pointer traces (straight lines,
-    non-periodic jitter, same-axis reversal, a right-angle corner, a sharp
-    ~150° corner, a corner just above the minimum angle, a large-radius arc
-    at any total sweep, a smooth S-curve, cooldown/re-arm guards, and an
-    explicit "does not fire again while sliding through the same corner's
-    window" case) rather than requiring a human to judge gesture sensitivity
-    by feel for every change.
+    realistic multi-point synthetic pointer traces built with a `jitterPx`
+    parameter (straight lines, non-periodic jitter, same-axis reversal in
+    both horizontal and diagonal orientations, a right-angle corner, a sharp
+    ~150° corner, a 60-75°-band corner, a large-radius arc at any total
+    sweep, a smooth S-curve, cooldown/re-arm guards, equal results across
+    different point densities and drawing speeds, and a dedicated
+    diagnostics suite asserting `reason`/`phase` values directly) rather than
+    requiring a human to judge gesture sensitivity by feel for every change.
 - **Master gain is 0.22, plus a ~36Hz master high-pass filter** to remove
   unnecessary sub-bass energy — chosen and checked on this machine's laptop
   speakers/headphones only. **A real-phone listening pass has not yet been

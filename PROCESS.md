@@ -505,3 +505,227 @@ respected below — the fix applied everywhere, not branched by browser name.
 - Deployment and the fourth cross-device retest checkpoint are the next
   steps (see below); notation/UI work remains explicitly not started, per
   the user's instruction not to begin it until this checkpoint is approved.
+
+## Gesture classification fix: axis-reversal exception and monotonic drift
+
+The fourth checkpoint's report was narrower than the previous rounds: audio
+envelopes, balance, and harmony were accepted as-is, with one remaining
+functional problem — chord-change detection was inconsistent, sometimes
+missing an obvious corner and sometimes firing on a vibrato wobble. The user
+asked for this to be fixed in isolation, with an explicit state machine, a
+same-axis-reversal exception evaluated before the corner-angle check, distance-
+based (not time-based) sampling, dev-only diagnostics, and a specific test
+matrix built from realistic multi-point paths. Nothing outside `gesture.ts`
+and `spec/gesture.test.ts` was touched.
+
+### Root cause of the inconsistent behaviour
+
+The previous round's stable-segment rewrite (see "Cross-device retest" above)
+already fixed the smooth-curve false positives, but it still treated the
+*directed* heading difference between the incoming and outgoing segments as
+the only signal for "is this a corner." That conflates two geometrically
+different situations that happen to produce the same large directed heading
+change:
+
+- A real corner: the incoming and outgoing segments sit on genuinely
+  different lines.
+- A same-axis reversal (vibrato/scrubbing): the pointer retraces
+  approximately the same line in the opposite direction. Directed heading
+  flips by close to 180° — a *larger* raw heading change than most real
+  corners — even though geometrically the two segments are the same
+  undirected axis.
+
+Scoring only directed heading meant a wide corner-angle ceiling was needed to
+admit sharp near-reversal V-corners, and that same wide ceiling let ordinary
+back-and-forth vibrato through as a false "corner." Narrowing the ceiling to
+exclude vibrato would have also excluded genuine sharp corners — the two
+cannot be separated on directed heading alone, which is exactly what made the
+old detector feel simultaneously too conservative and too sensitive depending
+on which failure mode a given retest happened to hit.
+
+### How same-axis reversal is distinguished from a real corner
+
+Every candidate now computes **two** independent quantities from the same
+incoming/outgoing segment pair:
+
+- **Directed heading difference** (`headingDifferenceDeg`, 0-180°): how far
+  the pointer's direction of travel actually turned.
+- **Undirected axis difference** (`axisDifferenceDeg`, 0-90°): the incoming
+  and outgoing segments' headings folded modulo 180° and compared — a line
+  and its exact opposite fold to the same axis, so this measures "are these
+  two segments on the same line," independent of which way the pointer moved
+  along it.
+
+The axis-reversal check is evaluated **before** the corner-angle-range check,
+per the brief: if `axisDifferenceDeg <= AXIS_REVERSAL_MAX_DEG` (28°), the
+candidate is classified `axis-reversal` and rejected as a corner regardless of
+how large the directed heading swing is — a near-180° reversal can never fall
+through and get scored as "just a very sharp corner." Only once a candidate
+clears the axis-reversal exception does its directed heading get checked
+against the corner-angle range.
+
+Between the unambiguous corner ceiling (`CORNER_ANGLE_MAX_DEG=135°`) and an
+exact reversal there remains a genuinely ambiguous band (an imprecisely
+retraced reversal and a very sharp isolated corner can look identical from
+local two-segment geometry alone). In that band only, recent same-axis
+oscillation intensity (the existing fine-grained vibrato detector, unchanged)
+breaks the tie: no recent oscillation reads as a genuine sharp corner; recent
+oscillation reads as continued scrubbing (`VIBRATO_AMBIGUOUS_MAX_INTENSITY=0.15`).
+
+### How a sharp corner is distinguished from a smooth curve
+
+This part was already correct in the previous round's stable-segment model
+and is unchanged in its gating logic: both the incoming and outgoing segments
+must independently pass a straightness-ratio check
+(`chordLength / pathLength >= SEGMENT_STRAIGHTNESS_MIN_RATIO=0.92`) before any
+angle is even computed. A smooth curve's local segments never get straight
+enough to pass this gate at the 30px segment length used here, so a circle,
+arc, or S-curve never reaches the angle/axis comparison at all — it's
+rejected at the stability check, not at the angle check. This is why a large
+arc that sweeps 360° still never fires: the corner detector has no
+"cumulative direction change" state to accumulate against in the first place.
+
+What changed this round is **diagnostic accuracy, not the gate**: the
+`turnAngle < CORNER_ANGLE_MIN_DEG` branch (heading changed a little, but not
+enough to be a corner candidate) and the two `!isStableSegment` branches
+previously used raw directional-variance/ratio magnitude to *label* the
+rejection as `"jitter"` or `"curve"` for diagnostics. An empirical trace
+showed this magnitude heuristic backwards: a large gentle arc's per-step
+heading deviation was consistently lower (~6°) than a genuinely jittery
+straight line's (~17-20°), because jitter's per-step swings are larger but
+uncorrelated while a curve's are small but systematic — the opposite of what
+a "low variance = curve" heuristic assumes. The fix
+(`GestureAnalyzer.isMonotonicDrift`) splits the window into
+`DRIFT_CHUNK_COUNT=4` equal-distance sub-chords (via the same
+`interpolateAtDistance` used for the main segments) and checks whether
+consecutive sub-chord headings keep rotating the *same way* (signed, not
+unsigned, heading delta), ignoring deltas below `DRIFT_NOISE_FLOOR_DEG=1.5°`
+as sampling noise. Same-signed throughout → `curve`; any sign flip → `jitter`.
+This is purely a diagnostic label — it never gates whether a corner fires,
+only explains why one didn't.
+
+### Final parameters
+
+| Constant | Value | Role |
+|---|---|---|
+| `NOISE_DISTANCE_PX` | 4px | minimum raw-sample spacing before a point is even recorded |
+| `SEGMENT_LENGTH_PX` | 30px | length of each stable window (incoming/outgoing), distance-based |
+| `SEGMENT_STRAIGHTNESS_MIN_RATIO` | 0.92 | chord/path-length ratio a segment must clear to count as "stable" |
+| `CORNER_ANGLE_MIN_DEG` | 70° | minimum directed heading change to be a corner candidate |
+| `CORNER_ANGLE_MAX_DEG` | 135° | unambiguous corner ceiling; above this is the ambiguous band |
+| `AXIS_REVERSAL_MAX_DEG` | 28° | undirected axis difference at/under this = same-line reversal, checked before the angle range |
+| `VIBRATO_AMBIGUOUS_MAX_INTENSITY` | 0.15 | tiebreaker for the 135°-180° ambiguous band |
+| `CORNER_REARM_DISTANCE_PX` | 30px | distance the pivot must advance past a confirmed corner before another can fire |
+| `CHORD_CHANGE_COOLDOWN_MS` | 150ms | secondary real-time guard, never the sole rearm mechanism |
+| `DRIFT_CHUNK_COUNT` / `DRIFT_NOISE_FLOOR_DEG` | 4 / 1.5° | diagnostic-only curve-vs-jitter sub-chord check |
+
+These are the same core values carried forward from the previous round's
+stable-segment model (unchanged: `SEGMENT_LENGTH_PX`, `SEGMENT_STRAIGHTNESS_MIN_RATIO`,
+`CORNER_ANGLE_MIN_DEG`, `CORNER_REARM_DISTANCE_PX`, `CHORD_CHANGE_COOLDOWN_MS`),
+narrowed once (`CORNER_ANGLE_MAX_DEG` 165°→135°) and given a dedicated
+axis-reversal threshold and ambiguous-band tiebreaker this round to actually
+implement the axis/heading distinction, rather than trying to make one wide
+angle ceiling do both jobs.
+
+### Independence from pointer-event frequency
+
+Unchanged from the previous round and re-verified this round: every segment
+boundary (`incomingStart`, `pivot`, `end`) is pinned to an exact multiple of
+`SEGMENT_LENGTH_PX` of cumulative path distance via `interpolateAtDistance`,
+which linearly interpolates between whichever two raw samples bracket that
+exact distance. This means the incoming/outgoing windows always cover the
+same physical 30px of travel regardless of how many raw pointer events
+arrived along the way or how fast the pointer was moving — a device emitting
+events at 60Hz and one emitting at 120Hz produce the same windows for the
+same physical gesture. The existing "produces the same result for equivalent
+paths sampled at different point densities" and "...drawn at different
+speeds" tests (unchanged, still passing) are the concrete evidence for this.
+
+### A known geometric sensitivity, disclosed honestly
+
+While building the required test matrix, closed-form analysis showed that
+straightness-ratio near-cancellation makes near-180° turns dramatically more
+sensitive to a segment window straddling the vertex by even a couple of
+pixels than moderate-angle corners are — at a 150° turn, 2px of "wrong-leg"
+contamination in a 30px window drops the ratio from ~1.0 to ~0.876 (below the
+0.92 gate); at 90°, the same 2px only drops it to ~0.936 (still passing).
+This is an inherent property of ratio-based straightness detection near
+reversal angles, not a defect in the classification logic — it means a
+genuinely very sharp, very precisely-drawn near-reversal corner needs a
+somewhat cleaner incoming/outgoing line than a right-angle corner does to be
+recognized at all. This wasn't loosened away (doing so would reopen the
+vibrato false-positive problem this round exists to fix); it's named here so
+a future report of "very sharp corners feel slightly less reliable than
+right-angle ones" has a documented, understood cause rather than reading as a
+new regression.
+
+### Diagnostics
+
+`GestureAnalyzer.getDiagnostics()` now returns, after every `addSample()`
+call: `phase` (`collectingIncomingSegment` / `candidateTurn` /
+`confirmingOutgoingSegment` / `cornerTriggered` / `stableAfterCorner`),
+`reason` (`corner` / `curve` / `axis-reversal` / `jitter` /
+`insufficient-data`), `triggered`, a human-readable `detail` string naming
+the exact accept/reject reason, both directed headings, the directed heading
+difference, the undirected axis difference, both segment lengths, and the
+directional-variance diagnostic. This is a plain getter with no console
+output in production paths; the one `console.debug` call (corner-confirmed
+summary) remains gated behind `import.meta.env.DEV`, unchanged from the
+previous round, and confirmed still absent from the built bundle (see
+verification below).
+
+### Test results
+
+`spec/gesture.test.ts`: **33/33 passing**, built from realistic multi-point
+paths (not idealized 3-point corners) with human-jitter helpers
+(`straightRun`/`cornerPath`/`backAndForthRun`/`arcRun` all take a `jitterPx`
+parameter). Covers every case in the brief's required matrix: 90° L-shape
+(once), acute 150° V-shape (once), 60-75°-band turn (once, at 73°), gentle
+arc (zero), full circle (zero), smooth S-curve (zero), horizontal/diagonal/
+repeated-vibrato back-and-forth (zero each), back-and-forth with small
+perpendicular jitter (zero), a real corner after a period of vibrato
+(exactly once), two separated corners (exactly twice), equal results across
+different point densities and different drawing speeds, plus a dedicated
+`GestureAnalyzer: diagnostics` suite asserting `reason` is exactly `corner`
+for a confirmed corner, `axis-reversal` (not `corner`) for a same-axis
+reversal, `curve` (not `jitter` or `corner`) for a gentle arc, and that
+`headingDifferenceDeg`/`axisDifferenceDeg` are independently reported and
+numerically correct (≈90°/≈90° for a right-angle corner).
+
+Two synthetic-test-only pitfalls were found and fixed in the test file, not
+in `gesture.ts`: (1) a uniform `stepPx` that doesn't evenly divide
+`SEGMENT_LENGTH_PX=30` leaves a fixed, deterministic pivot-to-vertex
+misalignment on a perfectly uniform synthetic path (real, non-uniform pointer
+input never locks onto one fixed bad offset the way a uniform-step synthetic
+path does) — fixed by using `stepPx=5` for the angle-sensitive tests; (2)
+three diagnostics tests were checking `getDiagnostics()`/`chordChangeTriggered`
+after the whole sample loop finished rather than at the specific sample where
+the event of interest occurred — fixed by capturing state inside the loop, at
+the trigger.
+
+A pre-existing `directionalVariance` parameter-type gap (`start` was typed as
+`{x, cumDist}`, missing `y`, though the function body used `start.y`) was
+also found and fixed while running `pnpm typecheck` — a type-checking gap
+rather than a runtime bug (the actual call site always passed a full
+`{x,y,cumDist}` object), unrelated to this round's classification logic but
+caught and corrected as part of getting `pnpm check` fully green.
+
+### Verification status (honest, as of this classification round)
+
+- `pnpm check` is green: **9 test files, 115 tests passing**, `tsc --noEmit`
+  clean, `vite build` succeeds.
+- **Structurally verified**: every segment boundary is distance-interpolated,
+  not raw-sample-snapped (re-confirmed by re-reading `interpolateAtDistance`
+  and its call sites); the axis-reversal check runs before the corner-angle
+  check in `detectCorner()`'s control flow (re-confirmed by reading the
+  function top-to-bottom); the curve/jitter diagnostic label now depends on
+  sign-consistency across sub-chords, not raw variance magnitude, for all
+  three branches that assign it.
+- **Not verified, and not claimed as verified**: whether this reads as
+  "right" on a real hand-drawn gesture across Mac/Windows/mobile — every test
+  above runs against synthetic pointer traces in this environment, which has
+  no access to real touch/mouse hardware or human motor noise. That is
+  exactly what the user's manual cross-device retest below is for.
+- Deployment (see below) and the user's manual retest are the next and final
+  steps for this round; per standing instruction, no further tuning or
+  notation/UI work proceeds until that retest comes back.
