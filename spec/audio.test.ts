@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   AudioEngine,
   CORNER_PRESENCE_FLOOR,
@@ -87,9 +87,31 @@ class FakeOscillatorNode extends FakeAudioNode {
   removeEventListener() {}
 }
 
+class FakeWaveShaperNode extends FakeAudioNode {
+  curve: Float32Array | null = null;
+}
+
+class FakeAudioBufferSourceNode extends FakeAudioNode {
+  buffer: unknown = null;
+  stopScheduledAt: number | null = null;
+  private endedListeners: Array<() => void> = [];
+  start() {}
+  stop(t?: number) {
+    this.stopScheduledAt = t ?? null;
+  }
+  fireEnded() {
+    for (const fn of this.endedListeners) fn();
+  }
+  addEventListener(type: string, fn: () => void) {
+    if (type === "ended") this.endedListeners.push(fn);
+  }
+  removeEventListener() {}
+}
+
 class FakeAudioContext {
   currentTime = 0;
   state = "running";
+  sampleRate = 44100;
   destination = new FakeAudioNode();
   createGain() {
     return new FakeGainNode();
@@ -99,6 +121,15 @@ class FakeAudioContext {
   }
   createOscillator() {
     return new FakeOscillatorNode();
+  }
+  createWaveShaper() {
+    return new FakeWaveShaperNode();
+  }
+  createBuffer(_channels: number, length: number) {
+    return { length, getChannelData: () => new Float32Array(length) };
+  }
+  createBufferSource() {
+    return new FakeAudioBufferSourceNode();
   }
   resume() {
     return Promise.resolve();
@@ -175,8 +206,8 @@ describe("AudioEngine: sustained pointer-lifecycle voices", () => {
     const context = engine.ensureContext() as unknown as FakeAudioContext;
     void context;
     // Simulate playback reaching the end of the release ramp.
-    const engineInternals = engine as unknown as { activeVoices: Array<{ oscillator: FakeOscillatorNode }> };
-    for (const voice of engineInternals.activeVoices) voice.oscillator.fireEnded();
+    const engineInternals = engine as unknown as { activeVoices: Array<{ oscillators: FakeOscillatorNode[] }> };
+    for (const voice of engineInternals.activeVoices) voice.oscillators[0].fireEnded();
     expect(engine.activeVoiceCount).toBe(0);
   });
 
@@ -199,7 +230,7 @@ describe("AudioEngine: sustained pointer-lifecycle voices", () => {
     engine.ensureContext();
     engine.startChord(chordEvent("C"));
     const internals = engine as unknown as {
-      activeVoices: Array<{ oscillator: FakeOscillatorNode; envelopeGain: { gain: FakeAudioParam } }>;
+      activeVoices: Array<{ oscillators: FakeOscillatorNode[]; envelopeGain: { gain: FakeAudioParam } }>;
     };
     const [voice] = internals.activeVoices;
     const gainBeforeRelease = voice.envelopeGain.gain.value;
@@ -223,8 +254,8 @@ describe("AudioEngine: sustained pointer-lifecycle voices", () => {
 
     // The oscillator is scheduled to stop only once the full release tail
     // has had time to become inaudible, not stopped immediately.
-    expect(voice.oscillator.stopScheduledAt).not.toBeNull();
-    expect(voice.oscillator.stopScheduledAt as number).toBeCloseTo(RELEASE_SECONDS + SCHEDULING_LOOKAHEAD_SECONDS);
+    expect(voice.oscillators[0].stopScheduledAt).not.toBeNull();
+    expect(voice.oscillators[0].stopScheduledAt as number).toBeCloseTo(RELEASE_SECONDS + SCHEDULING_LOOKAHEAD_SECONDS);
   });
 
   it("on a confirmed corner, the incoming chord becomes audible much faster than the outgoing chord fades", () => {
@@ -418,6 +449,156 @@ describe("AudioEngine: Brass vs Strings are audibly distinct", () => {
     // Brass's attack is unchanged from the pre-existing baseline other tests
     // in this file assert against.
     expect(attackTime(brassEngine)).toBeCloseTo(GESTURE_START_ATTACK_SECONDS + SCHEDULING_LOOKAHEAD_SECONDS);
+  });
+
+  function voicesOf(engine: AudioEngine) {
+    return (
+      engine as unknown as {
+        activeVoices: Array<{
+          oscillators: FakeOscillatorNode[];
+          filter: { frequency: FakeAudioParam };
+          releaseSeconds: number;
+          maxVibratoCents: number;
+        }>;
+      }
+    ).activeVoices;
+  }
+
+  it("gives each note a layered unison of more than one oscillator type, not a lone sawtooth", () => {
+    const brassEngine = new AudioEngine();
+    brassEngine.ensureContext();
+    brassEngine.startChord(chordEvent("C", "brass"));
+    const stringsEngine = new AudioEngine();
+    stringsEngine.ensureContext();
+    stringsEngine.startChord(chordEvent("C", "strings"));
+
+    const brassTypes = new Set(voicesOf(brassEngine)[0].oscillators.map((o) => o.type));
+    const stringsTypes = new Set(voicesOf(stringsEngine)[0].oscillators.map((o) => o.type));
+
+    // Each preset layers more than one waveform per note...
+    expect(brassTypes.size).toBeGreaterThan(1);
+    expect(stringsTypes.size).toBeGreaterThan(1);
+    // ...and the two presets are not simply the same layered unison behind a
+    // different filter — a darker version of the same oscillator was
+    // explicitly rejected as insufficient.
+    expect([...brassTypes].sort()).not.toEqual([...stringsTypes].sort());
+  });
+
+  it("gives brass an attack-scoop pitch dip that strings does not have", () => {
+    const brassEngine = new AudioEngine();
+    brassEngine.ensureContext();
+    brassEngine.startChord(chordEvent("C", "brass"));
+    const stringsEngine = new AudioEngine();
+    stringsEngine.ensureContext();
+    stringsEngine.startChord(chordEvent("C", "strings"));
+
+    const brassOsc = voicesOf(brassEngine)[0].oscillators[0];
+    const stringsOsc = voicesOf(stringsEngine)[0].oscillators[0];
+
+    // Brass's core layer detune starts flat and ramps up to its steady
+    // value — a scoop. Strings' core layer detune is set once and never
+    // ramped.
+    const brassRamps = brassOsc.detune.calls.filter((c) => c.method === "linearRampToValueAtTime");
+    const stringsRamps = stringsOsc.detune.calls.filter((c) => c.method === "linearRampToValueAtTime");
+    expect(brassRamps.length).toBeGreaterThan(0);
+    expect(stringsRamps.length).toBe(0);
+  });
+
+  it("gives brass a brief brighter filter transient that strings does not have", () => {
+    const brassEngine = new AudioEngine();
+    brassEngine.ensureContext();
+    brassEngine.startChord(chordEvent("C", "brass"));
+    const stringsEngine = new AudioEngine();
+    stringsEngine.ensureContext();
+    stringsEngine.startChord(chordEvent("C", "strings"));
+
+    const brassFilterRamps = voicesOf(brassEngine)[0].filter.frequency.calls.filter(
+      (c) => c.method === "linearRampToValueAtTime",
+    );
+    const stringsFilterRamps = voicesOf(stringsEngine)[0].filter.frequency.calls.filter(
+      (c) => c.method === "linearRampToValueAtTime",
+    );
+    expect(brassFilterRamps.length).toBeGreaterThan(0);
+    expect(stringsFilterRamps.length).toBe(0);
+  });
+
+  it("gives strings a subtle filtered bow-noise burst at the attack that brass does not have", () => {
+    const brassEngine = new AudioEngine();
+    const brassContext = brassEngine.ensureContext() as unknown as { createBufferSource: () => unknown };
+    const brassSpy = vi.spyOn(brassContext, "createBufferSource");
+    brassEngine.startChord(chordEvent("C", "brass"));
+    expect(brassSpy).not.toHaveBeenCalled();
+
+    const stringsEngine = new AudioEngine();
+    const stringsContext = stringsEngine.ensureContext() as unknown as { createBufferSource: () => unknown };
+    const stringsSpy = vi.spyOn(stringsContext, "createBufferSource");
+    stringsEngine.startChord(chordEvent("C", "strings"));
+    expect(stringsSpy).toHaveBeenCalled();
+  });
+
+  it("gives strings a longer, softer release than brass", () => {
+    const brassEngine = new AudioEngine();
+    brassEngine.ensureContext();
+    brassEngine.startChord(chordEvent("C", "brass"));
+    const stringsEngine = new AudioEngine();
+    stringsEngine.ensureContext();
+    stringsEngine.startChord(chordEvent("C", "strings"));
+
+    expect(voicesOf(stringsEngine)[0].releaseSeconds).toBeGreaterThan(voicesOf(brassEngine)[0].releaseSeconds);
+  });
+
+  it("delays strings' vibrato onset while brass reaches full vibrato depth immediately", () => {
+    const brassEngine = new AudioEngine();
+    brassEngine.ensureContext();
+    brassEngine.startChord(chordEvent("C", "brass"));
+    const stringsEngine = new AudioEngine();
+    stringsEngine.ensureContext();
+    stringsEngine.startChord(chordEvent("C", "strings"));
+
+    const onsetGainOf = (engine: AudioEngine) =>
+      (engine as unknown as { activeVoices: Array<{ vibratoOnsetGain: { gain: FakeAudioParam } }> })
+        .activeVoices[0].vibratoOnsetGain.gain;
+
+    expect(onsetGainOf(brassEngine).calls.length).toBe(0);
+    expect(onsetGainOf(brassEngine).value).toBe(1);
+    expect(onsetGainOf(stringsEngine).calls.some((c) => c.method === "linearRampToValueAtTime" && c.value === 1)).toBe(
+      true,
+    );
+  });
+
+  it("gives brighter (soprano) voices more vibrato depth than darker (bass) voices, in both ensembles", () => {
+    for (const ensemble of ["brass", "strings"] as const) {
+      const engine = new AudioEngine();
+      engine.ensureContext();
+      engine.startChord(chordEvent("C", ensemble));
+      const voices = voicesOf(engine);
+      const soprano = voices[0];
+      const bass = voices[voices.length - 1];
+      expect(soprano.maxVibratoCents).toBeGreaterThan(bass.maxVibratoCents);
+    }
+  });
+
+  it("normalizes each preset's oscillator-layer gains to sum to ~1, so neither ensemble reads louder purely from layering more oscillators", () => {
+    // A direct check on the source of loudness matching between the two
+    // presets — see PROCESS.md for why this, not a real listening pass, is
+    // the actual verification available in this environment.
+    const brassEngine = new AudioEngine();
+    brassEngine.ensureContext();
+    brassEngine.startChord(chordEvent("C", "brass"));
+    const stringsEngine = new AudioEngine();
+    stringsEngine.ensureContext();
+    stringsEngine.startChord(chordEvent("C", "strings"));
+
+    const layerGainSum = (engine: AudioEngine) =>
+      (engine as unknown as { activeVoices: Array<{ layerGains: FakeGainNode[] }> }).activeVoices[0].layerGains.reduce(
+        (sum, g) => sum + g.gain.value,
+        0,
+      );
+
+    // Only the core layer is unscaled at full brightness (soprano voice,
+    // brightness 1) — so at soprano this sum should land at ~1 for both.
+    expect(layerGainSum(brassEngine)).toBeCloseTo(1, 1);
+    expect(layerGainSum(stringsEngine)).toBeCloseTo(1, 1);
   });
 });
 

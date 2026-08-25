@@ -5,7 +5,10 @@ import type { Ensemble, Voice, VoicedNote } from "./voicing";
 // plus four for the previous chord while a crossfade is still in flight —
 // never more, because a confirmed corner always steals any leftover
 // crossfade-out group immediately rather than letting a third generation
-// accumulate.
+// accumulate. A "voice" here is one chord note (soprano/alto/tenor/bass),
+// even though each now drives 2-3 real oscillators internally (see
+// `OscillatorLayer` below) — the cap is about chord polyphony, not raw
+// oscillator count.
 export const MAX_ACTIVE_VOICES = 8;
 
 const MASTER_GAIN = 0.22;
@@ -59,7 +62,11 @@ export const CORNER_PRESENCE_FLOOR = 0.5;
 // not a linear cut — before the oscillators are stopped/disconnected.
 // Extended from an earlier 0.85s: a listening pass on the deployed build
 // still read the shorter tail as "fades out too quickly." 1.5s is the
-// brief's suggested starting point within its 1.2-1.8s range.
+// brief's suggested starting point within its 1.2-1.8s range. Strings uses
+// its own, longer release (see STRINGS_PRESET) — a bowed ensemble settles
+// more slowly than articulate brass, and release duration is exactly the
+// kind of per-ensemble character difference Part B asks for, so it is no
+// longer a single shared constant (see `ActiveVoice.releaseSeconds` below).
 export const RELEASE_SECONDS = 1.5;
 export const RELEASE_TIME_CONSTANT_SECONDS = 0.3; // ~5 time constants ≈ RELEASE_SECONDS
 export const RELEASE_FLOOR = 0.0001; // exponential decay can only approach 0, never reach it
@@ -72,6 +79,7 @@ const LEVEL_RISE_SECONDS = 0.09;
 const LEVEL_FALL_SECONDS = 0.18;
 const EXPRESSION_SMOOTHING_SECONDS = 0.06;
 const VIBRATO_RATE_HZ = 5.5;
+const NOISE_BUFFER_SECONDS = 0.5;
 
 // Per-voice relative gain balance (section 2): upper voices carry the melodic
 // line clearly, the bass anchors without dominating.
@@ -96,40 +104,144 @@ export function speedToLevel(speedPxPerSec: number): number {
   return HELD_MINIMUM_LEVEL + t * (1 - HELD_MINIMUM_LEVEL);
 }
 
+// A single note is no longer one oscillator: it's a small fixed unison of
+// 2-3 layers (a "core" fundamental plus one or two "color" layers) summed
+// before filtering. This is what actually separates Brass from Strings —
+// a darker filter alone on the same lone sawtooth was explicitly rejected
+// (see CLAUDE.md/PROCESS.md) as "a darker version of the same oscillator."
+// Layer gains are chosen to sum to ~1.0 per preset so neither ensemble reads
+// louder purely from having more oscillators summed into the same filter.
+type OscillatorLayer = {
+  type: OscillatorType;
+  detuneCents: number;
+  gain: number;
+  /** Only "color" layers are scaled by a voice's brightnessByVoice entry —
+   *  the "core" layer always carries the fundamental at full weight so the
+   *  note never loses its pitch identity at low brightness. */
+  role: "core" | "color";
+};
+
 type Preset = {
-  oscillatorType: OscillatorType;
+  layers: OscillatorLayer[];
   filterFrequencyByVoice: Record<Voice, number>;
   filterQ: number;
-  /** Detune depth in cents at full (1.0) vibrato intensity. */
-  vibratoCents: number;
+  /** How much the filter brightens with rising speed/volume, centred on
+   *  filterFrequencyByVoice (0 = filter ignores movement entirely). Brass's
+   *  breath-driven brightness should track how hard the ensemble is
+   *  "blown"; a bowed string section changes tone color far less with bow
+   *  speed, so this stays small for strings rather than off entirely. */
+  filterBrightnessRange: number;
+  /** 0-1 per voice: scales each note's "color" layer(s), the attack
+   *  transient, and the pitch-scoop depth. Trumpet/Violin (soprano) is
+   *  brightest/clearest; Tuba/Double Bass (bass) is the most restrained. */
+  brightnessByVoice: Record<Voice, number>;
+  vibratoCentsByVoice: Record<Voice, number>;
+  /** 0 = vibrato is at full requested depth immediately; >0 = depth fades
+   *  in over this many seconds after the note starts. Brass vibrato is
+   *  immediate; bowed strings settle into vibrato only once a note is
+   *  established. */
+  vibratoOnsetSeconds: number;
   /** Multiplies whatever attack duration the caller passes to createVoice
    *  (GESTURE_START_ATTACK_SECONDS or INCOMING_ATTACK_SECONDS) — brass is
    *  articulate (a near-instant onset), bowed strings swell in gradually.
    *  Brass stays at 1 (the un-scaled baseline the existing attack-timing
    *  tests were written against); only strings scales up. */
   attackScale: number;
+  releaseSeconds: number;
+  releaseTimeConstantSeconds: number;
+  /** Precomputed waveshaper curve — a mild, blended soft-clip. Brass uses a
+   *  larger amount for a breath-driven "edge"; strings a much smaller one,
+   *  just enough to avoid a perfectly clean, synth-like tone. */
+  saturationCurve: Float32Array<ArrayBuffer>;
+  /** Pitch instability at the front of a note (brass only): each layer
+   *  starts this many cents flat and settles to its steady detune over
+   *  scoopSeconds — a breath-driven attack "scoop" rather than a perfectly
+   *  tuned onset. */
+  scoopCents?: number;
+  scoopSeconds?: number;
+  /** Brief brighter filter opening at the front of a note (brass only): the
+   *  filter cutoff starts above its steady-state value and settles down
+   *  over transientSeconds. */
+  transientSeconds?: number;
+  transientPeakMultiplierByVoice?: Record<Voice, number>;
+  /** Subtle filtered bow-noise burst at the front of a note (strings only):
+   *  peak linear gain (kept low deliberately — this must read as breath/bow
+   *  texture, never as broadband hiss), scaled per voice. */
+  noiseAmount?: number;
+  noiseByVoice?: Record<Voice, number>;
 };
 
-// Brass Choir (section 6): bright sawtooth, brighter filtering on upper
-// voices than the bass, modest vibrato depth (±4-8 cents at full intensity),
-// a near-instant attack.
+/** A mild, blended soft-clip curve: `amount` 0 is a pure linear pass-through
+ *  (no waveshaping at all), 1 is a fully saturated tanh curve. Used at small
+ *  amounts only — this is meant to add a breath-driven "edge" (brass) or a
+ *  touch of bowed warmth (strings), not distortion. */
+function makeSaturationCurve(amount: number): Float32Array<ArrayBuffer> {
+  const samples = 256;
+  const curve = new Float32Array(samples);
+  const normalizer = Math.tanh(3);
+  for (let i = 0; i < samples; i++) {
+    const x = (i / (samples - 1)) * 2 - 1;
+    curve[i] = (1 - amount) * x + amount * (Math.tanh(x * 3) / normalizer);
+  }
+  return curve;
+}
+
+// Brass Choir (Part B, section 8): bright/firm/breath-driven. A layered
+// saw+square unison (not a lone sawtooth) gives the "brassy" edge a filter
+// alone cannot; the square layer and the attack transient/scoop are both
+// scaled down toward the bass voices so Tuba stays a restrained foundation
+// rather than as bright as Trumpet.
+const BRASS_BRIGHTNESS_BY_VOICE: Record<Voice, number> = { soprano: 1, alto: 0.75, tenor: 0.55, bass: 0.35 };
+
 const BRASS_PRESET: Preset = {
-  oscillatorType: "sawtooth",
+  layers: [
+    { type: "sawtooth", detuneCents: 0, gain: 0.58, role: "core" },
+    { type: "square", detuneCents: 6, gain: 0.27, role: "color" },
+    { type: "sawtooth", detuneCents: -8, gain: 0.15, role: "color" },
+  ],
   filterFrequencyByVoice: { soprano: 3400, alto: 2800, tenor: 1800, bass: 1100 },
   filterQ: 1.0,
-  vibratoCents: 6,
+  filterBrightnessRange: 0.35,
+  brightnessByVoice: BRASS_BRIGHTNESS_BY_VOICE,
+  vibratoCentsByVoice: { soprano: 7, alto: 6, tenor: 5, bass: 3 },
+  vibratoOnsetSeconds: 0,
   attackScale: 1,
+  releaseSeconds: RELEASE_SECONDS,
+  releaseTimeConstantSeconds: RELEASE_TIME_CONSTANT_SECONDS,
+  saturationCurve: makeSaturationCurve(0.22),
+  scoopCents: 9,
+  scoopSeconds: 0.045,
+  transientSeconds: 0.07,
+  transientPeakMultiplierByVoice: { soprano: 1.6, alto: 1.45, tenor: 1.3, bass: 1.15 },
 };
 
-// Symphonic Strings: darker filtering, wider vibrato depth (±10-18 cents),
-// and a slower bow-swell attack (60% longer) rather than brass's near-instant
-// onset — the clearest single audible cue that a switch actually happened.
+// Symphonic Strings (Part B, section 9): warm/bowed/evolving — deliberately
+// not "brass with a lower filter." A triangle-led unison (instead of brass's
+// saw+square) is the fundamental timbral difference; a slower bow-swell
+// attack, delayed vibrato onset, a subtle filtered bow-noise burst, and a
+// longer settling release are the bowed-specific character on top of that.
+const STRINGS_BRIGHTNESS_BY_VOICE: Record<Voice, number> = { soprano: 1, alto: 0.8, tenor: 0.6, bass: 0.4 };
+const STRINGS_RELEASE_SECONDS = RELEASE_SECONDS * 1.5;
+const STRINGS_RELEASE_TIME_CONSTANT_SECONDS = RELEASE_TIME_CONSTANT_SECONDS * 1.5;
+
 const STRINGS_PRESET: Preset = {
-  oscillatorType: "sawtooth",
+  layers: [
+    { type: "triangle", detuneCents: 0, gain: 0.5, role: "core" },
+    { type: "sawtooth", detuneCents: -5, gain: 0.3, role: "color" },
+    { type: "sawtooth", detuneCents: 6, gain: 0.2, role: "color" },
+  ],
   filterFrequencyByVoice: { soprano: 2600, alto: 2000, tenor: 1300, bass: 800 },
   filterQ: 0.7,
-  vibratoCents: 14,
+  filterBrightnessRange: 0.08,
+  brightnessByVoice: STRINGS_BRIGHTNESS_BY_VOICE,
+  vibratoCentsByVoice: { soprano: 16, alto: 14, tenor: 11, bass: 6 },
+  vibratoOnsetSeconds: 0.4,
   attackScale: 1.6,
+  releaseSeconds: STRINGS_RELEASE_SECONDS,
+  releaseTimeConstantSeconds: STRINGS_RELEASE_TIME_CONSTANT_SECONDS,
+  saturationCurve: makeSaturationCurve(0.05),
+  noiseAmount: 0.05,
+  noiseByVoice: { soprano: 1, alto: 0.85, tenor: 0.6, bass: 0.35 },
 };
 
 function presetFor(ensemble: Ensemble): Preset {
@@ -181,12 +293,19 @@ function releaseParam(param: AudioParam, floor: number, now: number, timeConstan
 type VoiceRole = "current" | "fading";
 
 type ActiveVoice = {
-  oscillator: OscillatorNode;
+  oscillators: OscillatorNode[];
+  layerGains: GainNode[];
+  shaper: WaveShaperNode;
   filter: BiquadFilterNode;
   levelGain: GainNode;
   envelopeGain: GainNode;
   vibratoScaleGain: GainNode;
+  vibratoOnsetGain: GainNode;
   maxVibratoCents: number;
+  baseFilterFrequency: number;
+  filterBrightnessRange: number;
+  releaseSeconds: number;
+  releaseTimeConstantSeconds: number;
   role: VoiceRole;
 };
 
@@ -201,6 +320,7 @@ export class AudioEngine {
   private masterGain: GainNode | null = null;
   private masterHighpass: BiquadFilterNode | null = null;
   private lfoOsc: OscillatorNode | null = null;
+  private noiseBuffer: AudioBuffer | null = null;
   private activeVoices: ActiveVoice[] = [];
   private currentLevel = HELD_MINIMUM_LEVEL;
   private currentVibratoIntensity = 0;
@@ -327,7 +447,11 @@ export class AudioEngine {
 
   /** Continuous expression update, called on every pointer move: `level`
    *  (0-1, see `speedToLevel`) drives the shared volume, `vibratoIntensity`
-   *  (0-1) drives the shared LFO's per-voice modulation depth. Only the
+   *  (0-1) drives the shared LFO's per-voice modulation depth. Brass also
+   *  brightens its filter with rising level ("movement-linked filter
+   *  brightness", Part B section 8); strings brightens far less
+   *  (filterBrightnessRange is small — see STRINGS_PRESET), keeping its
+   *  tone evolving gently rather than snapping bright. Only the
    *  currently-sustaining chord responds — a chord already fading out keeps
    *  its own envelope, undisturbed. */
   setExpression(level: number, vibratoIntensity: number): void {
@@ -346,7 +470,71 @@ export class AudioEngine {
       if (voice.role !== "current") continue;
       rampParam(voice.levelGain.gain, level, now, levelTarget);
       rampParam(voice.vibratoScaleGain.gain, vibratoIntensity * voice.maxVibratoCents, now, vibratoTarget);
+      if (voice.filterBrightnessRange > 0) {
+        const brightnessTarget =
+          voice.baseFilterFrequency * (1 - voice.filterBrightnessRange / 2 + voice.filterBrightnessRange * level);
+        rampParam(voice.filter.frequency, brightnessTarget, now, levelTarget);
+      }
     }
+  }
+
+  private getNoiseBuffer(context: AudioContext): AudioBuffer {
+    if (!this.noiseBuffer) {
+      const length = Math.max(1, Math.floor(context.sampleRate * NOISE_BUFFER_SECONDS));
+      const buffer = context.createBuffer(1, length, context.sampleRate);
+      const data = buffer.getChannelData(0);
+      for (let i = 0; i < length; i++) data[i] = Math.random() * 2 - 1;
+      this.noiseBuffer = buffer;
+    }
+    return this.noiseBuffer;
+  }
+
+  /** A brief, filtered noise burst under a string note's attack (Part B
+   *  section 9) — bow friction texture, not broadband hiss: band-limited
+   *  around the note's own pitch, low peak gain, and gone again well before
+   *  the note settles into its sustained tone. A no-op for presets without
+   *  noiseAmount (brass has none at all). */
+  private playBowNoiseBurst(note: VoicedNote, preset: Preset, startAt: number, attackSeconds: number): void {
+    const context = this.context;
+    const masterHighpass = this.masterHighpass;
+    if (!context || !masterHighpass || !preset.noiseAmount) return;
+    const amount = preset.noiseAmount * (preset.noiseByVoice?.[note.voice] ?? 1);
+    if (amount <= 0) return;
+
+    const source = context.createBufferSource();
+    source.buffer = this.getNoiseBuffer(context);
+
+    const noiseFilter = context.createBiquadFilter();
+    noiseFilter.type = "bandpass";
+    noiseFilter.frequency.value = midiToFrequency(note.midi) * 3;
+    noiseFilter.Q.value = 0.8;
+
+    const noiseGain = context.createGain();
+    const noiseAttack = Math.min(0.03, attackSeconds * 0.3);
+    noiseGain.gain.setValueAtTime(0, startAt);
+    noiseGain.gain.linearRampToValueAtTime(amount, startAt + noiseAttack);
+    noiseGain.gain.linearRampToValueAtTime(0, startAt + attackSeconds);
+
+    source.connect(noiseFilter);
+    noiseFilter.connect(noiseGain);
+    noiseGain.connect(masterHighpass);
+    source.start(startAt);
+
+    const stopAt = startAt + attackSeconds + 0.05;
+    try {
+      source.stop(stopAt);
+    } catch {
+      // already scheduled to stop — nothing to do.
+    }
+    source.addEventListener(
+      "ended",
+      () => {
+        noiseGain.disconnect();
+        noiseFilter.disconnect();
+        source.disconnect();
+      },
+      { once: true },
+    );
   }
 
   private createVoice(note: VoicedNote, preset: Preset, attackSeconds: number, levelOverride?: number): void {
@@ -357,50 +545,123 @@ export class AudioEngine {
 
     const now = context.currentTime;
     const startAt = now + SCHEDULING_LOOKAHEAD_SECONDS;
-
-    const oscillator = context.createOscillator();
-    oscillator.type = preset.oscillatorType;
-    oscillator.frequency.value = midiToFrequency(note.midi);
+    const voice = note.voice;
+    const baseFrequency = midiToFrequency(note.midi);
+    const brightness = preset.brightnessByVoice[voice];
 
     const filter = context.createBiquadFilter();
     filter.type = "lowpass";
-    filter.frequency.value = preset.filterFrequencyByVoice[note.voice];
+    const baseFilterFrequency = preset.filterFrequencyByVoice[voice];
+    filter.frequency.value = baseFilterFrequency;
     filter.Q.value = preset.filterQ;
+    // Brief brighter attack transient (brass only): the filter opens up
+    // above its steady-state cutoff for an instant, then settles — a
+    // breath-driven "bite" at the front of the note rather than a flat
+    // onset. Scaled down toward the bass voices, same as the scoop below.
+    if (preset.transientSeconds && preset.transientPeakMultiplierByVoice) {
+      const peak = baseFilterFrequency * preset.transientPeakMultiplierByVoice[voice];
+      filter.frequency.setValueAtTime(peak, startAt);
+      filter.frequency.linearRampToValueAtTime(baseFilterFrequency, startAt + preset.transientSeconds);
+    }
+
+    const shaper = context.createWaveShaper();
+    shaper.curve = preset.saturationCurve;
+
+    const oscillators: OscillatorNode[] = [];
+    const layerGains: GainNode[] = [];
+    for (const layer of preset.layers) {
+      const oscillator = context.createOscillator();
+      oscillator.type = layer.type;
+      oscillator.frequency.value = baseFrequency;
+      // Subtle pitch instability at onset (brass only): each layer starts a
+      // little flat and settles up to its steady unison detune — a
+      // breath-driven "scoop" rather than a perfectly tuned attack.
+      if (preset.scoopCents && preset.scoopSeconds) {
+        const scoop = preset.scoopCents * (0.5 + 0.5 * brightness);
+        oscillator.detune.setValueAtTime(layer.detuneCents - scoop, startAt);
+        oscillator.detune.linearRampToValueAtTime(layer.detuneCents, startAt + preset.scoopSeconds);
+      } else {
+        oscillator.detune.value = layer.detuneCents;
+      }
+
+      const layerGain = context.createGain();
+      // Only the colour layers vary with per-voice brightness — the core
+      // layer always carries the fundamental at full weight.
+      layerGain.gain.value = layer.role === "core" ? layer.gain : layer.gain * brightness;
+
+      oscillator.connect(layerGain);
+      layerGain.connect(shaper);
+      oscillator.start(startAt);
+
+      oscillators.push(oscillator);
+      layerGains.push(layerGain);
+    }
+    shaper.connect(filter);
 
     const levelGain = context.createGain();
     levelGain.gain.value = levelOverride ?? this.currentLevel;
 
     const envelopeGain = context.createGain();
     envelopeGain.gain.setValueAtTime(0, startAt);
-    envelopeGain.gain.linearRampToValueAtTime(
-      VOICE_RELATIVE_GAIN[note.voice],
-      startAt + attackSeconds * preset.attackScale,
-    );
+    const effectiveAttackSeconds = attackSeconds * preset.attackScale;
+    envelopeGain.gain.linearRampToValueAtTime(VOICE_RELATIVE_GAIN[voice], startAt + effectiveAttackSeconds);
 
     const vibratoScaleGain = context.createGain();
-    vibratoScaleGain.gain.value = this.currentVibratoIntensity * preset.vibratoCents;
+    vibratoScaleGain.gain.value = this.currentVibratoIntensity * preset.vibratoCentsByVoice[voice];
 
-    oscillator.connect(filter);
+    // Vibrato onset (Part B section 9): brass reaches its requested vibrato
+    // depth immediately; strings fades depth in from 0 over
+    // vibratoOnsetSeconds — a bowed note settles into vibrato rather than
+    // starting with it. Chained after vibratoScaleGain so the two multiply:
+    // final depth = (gesture-driven intensity * per-voice max) * onset ramp.
+    const vibratoOnsetGain = context.createGain();
+    if (preset.vibratoOnsetSeconds > 0) {
+      vibratoOnsetGain.gain.setValueAtTime(0, startAt);
+      vibratoOnsetGain.gain.linearRampToValueAtTime(1, startAt + preset.vibratoOnsetSeconds);
+    } else {
+      vibratoOnsetGain.gain.value = 1;
+    }
+
     filter.connect(levelGain);
     levelGain.connect(envelopeGain);
     envelopeGain.connect(masterHighpass);
 
     if (this.lfoOsc) {
       this.lfoOsc.connect(vibratoScaleGain);
-      vibratoScaleGain.connect(oscillator.detune);
+      vibratoScaleGain.connect(vibratoOnsetGain);
+      for (const oscillator of oscillators) vibratoOnsetGain.connect(oscillator.detune);
     }
 
-    oscillator.start(startAt);
+    this.playBowNoiseBurst(note, preset, startAt, effectiveAttackSeconds);
 
     this.activeVoices.push({
-      oscillator,
+      oscillators,
+      layerGains,
+      shaper,
       filter,
       levelGain,
       envelopeGain,
       vibratoScaleGain,
-      maxVibratoCents: preset.vibratoCents,
+      vibratoOnsetGain,
+      maxVibratoCents: preset.vibratoCentsByVoice[voice],
+      baseFilterFrequency,
+      filterBrightnessRange: preset.filterBrightnessRange,
+      releaseSeconds: preset.releaseSeconds,
+      releaseTimeConstantSeconds: preset.releaseTimeConstantSeconds,
       role: "current",
     });
+  }
+
+  private disconnectVoice(voice: ActiveVoice): void {
+    voice.envelopeGain.disconnect();
+    voice.filter.disconnect();
+    voice.levelGain.disconnect();
+    voice.vibratoScaleGain.disconnect();
+    voice.vibratoOnsetGain.disconnect();
+    voice.shaper.disconnect();
+    for (const layerGain of voice.layerGains) layerGain.disconnect();
+    for (const oscillator of voice.oscillators) oscillator.disconnect();
+    this.activeVoices = this.activeVoices.filter((v) => v !== voice);
   }
 
   private fadeOutVoice(voice: ActiveVoice, fadeSeconds: number): void {
@@ -414,27 +675,24 @@ export class AudioEngine {
     rampParam(voice.envelopeGain.gain, 0, now, now + fadeSeconds);
 
     const stopAt = now + fadeSeconds + SCHEDULING_LOOKAHEAD_SECONDS + 0.02;
-    try {
-      voice.oscillator.stop(stopAt);
-    } catch {
-      // already scheduled to stop — nothing to do.
+    for (const oscillator of voice.oscillators) {
+      try {
+        oscillator.stop(stopAt);
+      } catch {
+        // already scheduled to stop — nothing to do.
+      }
     }
 
-    const cleanup = () => {
-      voice.envelopeGain.disconnect();
-      voice.filter.disconnect();
-      voice.levelGain.disconnect();
-      voice.vibratoScaleGain.disconnect();
-      this.activeVoices = this.activeVoices.filter((v) => v !== voice);
-    };
-    voice.oscillator.addEventListener("ended", cleanup, { once: true });
+    voice.oscillators[0].addEventListener("ended", () => this.disconnectVoice(voice), { once: true });
   }
 
   /** Pointer-up release: an exponential decay toward near-silence, holding
    *  from whatever gain the chord was already at — a natural "settling" tail
    *  rather than the visibly linear cut a fixed-duration `linearRampToValueAtTime`
-   *  produces. Cleanup (stop/disconnect) is scheduled only once the decay has
-   *  had the full RELEASE_SECONDS to become inaudible, not the moment the
+   *  produces. Duration/time-constant come from the voice's own preset (see
+   *  ActiveVoice.releaseSeconds) — strings settles noticeably slower than
+   *  brass. Cleanup (stop/disconnect) is scheduled only once the decay has
+   *  had the full release duration to become inaudible, not the moment the
    *  ramp is scheduled. */
   private releaseVoice(voice: ActiveVoice): void {
     const context = this.context;
@@ -442,23 +700,18 @@ export class AudioEngine {
     voice.role = "fading";
 
     const now = context.currentTime;
-    releaseParam(voice.envelopeGain.gain, RELEASE_FLOOR, now, RELEASE_TIME_CONSTANT_SECONDS);
+    releaseParam(voice.envelopeGain.gain, RELEASE_FLOOR, now, voice.releaseTimeConstantSeconds);
 
-    const stopAt = now + RELEASE_SECONDS + SCHEDULING_LOOKAHEAD_SECONDS;
-    try {
-      voice.oscillator.stop(stopAt);
-    } catch {
-      // already scheduled to stop — nothing to do.
+    const stopAt = now + voice.releaseSeconds + SCHEDULING_LOOKAHEAD_SECONDS;
+    for (const oscillator of voice.oscillators) {
+      try {
+        oscillator.stop(stopAt);
+      } catch {
+        // already scheduled to stop — nothing to do.
+      }
     }
 
-    const cleanup = () => {
-      voice.envelopeGain.disconnect();
-      voice.filter.disconnect();
-      voice.levelGain.disconnect();
-      voice.vibratoScaleGain.disconnect();
-      this.activeVoices = this.activeVoices.filter((v) => v !== voice);
-    };
-    voice.oscillator.addEventListener("ended", cleanup, { once: true });
+    voice.oscillators[0].addEventListener("ended", () => this.disconnectVoice(voice), { once: true });
   }
 
   private stealOldestIfAtCap(): void {
@@ -474,10 +727,12 @@ export class AudioEngine {
 
     const now = context.currentTime;
     rampParam(oldest.envelopeGain.gain, 0, now, now + STEAL_FADE_SECONDS);
-    try {
-      oldest.oscillator.stop(now + STEAL_FADE_SECONDS + SCHEDULING_LOOKAHEAD_SECONDS + 0.01);
-    } catch {
-      // already scheduled to stop — nothing to do.
+    for (const oscillator of oldest.oscillators) {
+      try {
+        oscillator.stop(now + STEAL_FADE_SECONDS + SCHEDULING_LOOKAHEAD_SECONDS + 0.01);
+      } catch {
+        // already scheduled to stop — nothing to do.
+      }
     }
   }
 }
