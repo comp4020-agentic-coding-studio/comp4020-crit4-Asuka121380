@@ -11,21 +11,37 @@ export const MAX_ACTIVE_VOICES = 8;
 const MASTER_GAIN = 0.22;
 const MASTER_HIGHPASS_HZ = 36;
 
-const ATTACK_SECONDS = 0.05;
-// A confirmed corner starts the new chord immediately (from
-// `context.currentTime`, never a delayed timer). The incoming and outgoing
-// voices deliberately do NOT share one "crossfade" duration any more: making
-// the incoming chord audible fast is what makes a corner feel immediate;
-// how long the outgoing chord lingers is a separate, purely cosmetic tail
-// that can be slower without costing any felt latency. Conflating the two
-// (one shared ~100ms constant) was a root cause of "the audible chord still
-// changes noticeably later than confirmation" — a linear ramp from 0 spends
-// most of its early portion at low, easily-masked amplitude, so with a
-// 100ms attack the incoming chord wasn't perceptually dominant until close
-// to the full 100ms had elapsed, by which point the still-loud outgoing
-// chord had been masking it the whole time.
-export const INCOMING_ATTACK_SECONDS = 0.04;
-export const OUTGOING_FADE_SECONDS = 0.13;
+// Scheduling every automation event exactly at `context.currentTime` races
+// the audio render thread: by the time the main-thread call reaches the
+// renderer, the requested time can already be inside (or just behind) the
+// block currently being rendered, silently pushing the actual change out to
+// the next render quantum. That race is more visible on a larger render
+// quantum, which is why it read as Mac/Safari-specific even though the
+// gesture-confirmation -> `changeChord()` call itself was already measured
+// same-tick everywhere (see PROCESS.md). The fix is not a Safari branch — a
+// small forward lookahead applied identically on every platform gives the
+// renderer guaranteed lead time to enqueue the change before it's due.
+export const SCHEDULING_LOOKAHEAD_SECONDS = 0.008;
+
+// --- A: beginning a new conducting gesture (pointer-down) ------------------
+// Starts from near-silence with a gentle attack. This applies ONLY to the
+// first chord of a gesture, never to a corner arriving mid-gesture — see
+// startChord() vs changeChord() below.
+export const GESTURE_START_ATTACK_SECONDS = 0.22;
+
+// --- B: a confirmed corner during an ongoing gesture ------------------------
+// The incoming and outgoing voices deliberately do NOT share one "crossfade"
+// duration: making the incoming chord audible fast is what makes a corner
+// feel immediate; how long the outgoing chord lingers is a separate, purely
+// cosmetic tail that can be slower without costing any felt latency.
+// Conflating the two (one shared duration) was a root cause of "the audible
+// chord still changes noticeably later than confirmation" in an earlier
+// round — a linear ramp from 0 spends most of its early portion at low,
+// easily-masked amplitude, so the incoming chord wasn't perceptually
+// dominant until close to the full attack had elapsed, by which point the
+// still-loud outgoing chord had been masking it the whole time.
+export const INCOMING_ATTACK_SECONDS = 0.035;
+export const OUTGOING_FADE_SECONDS = 0.15;
 // A confirmed corner is, by definition, a deliberate gesture — but a hand
 // physically slows down while pivoting through a sharp turn, which can drive
 // the continuously speed-driven volume level to its quietest point at
@@ -36,12 +52,18 @@ export const OUTGOING_FADE_SECONDS = 0.13;
 // audible presence at the moment it's created; ordinary speed-driven
 // `setExpression` calls immediately continue adjusting it from there.
 export const CORNER_PRESENCE_FLOOR = 0.5;
+
+// --- C: releasing the pointer -----------------------------------------------
 // Pointer-up preserves whatever gain the chord was already at and decays
 // exponentially toward near-silence — a natural "ensemble settling" tail,
 // not a linear cut — before the oscillators are stopped/disconnected.
-export const RELEASE_SECONDS = 0.85;
-export const RELEASE_TIME_CONSTANT_SECONDS = 0.17; // ~5 time constants ≈ RELEASE_SECONDS
+// Extended from an earlier 0.85s: a listening pass on the deployed build
+// still read the shorter tail as "fades out too quickly." 1.5s is the
+// brief's suggested starting point within its 1.2-1.8s range.
+export const RELEASE_SECONDS = 1.5;
+export const RELEASE_TIME_CONSTANT_SECONDS = 0.3; // ~5 time constants ≈ RELEASE_SECONDS
 export const RELEASE_FLOOR = 0.0001; // exponential decay can only approach 0, never reach it
+
 const STEAL_FADE_SECONDS = 0.03;
 // Continuous speed-to-volume response is asymmetric: quicker to rise (a
 // sudden increase in speed should be heard right away) than to fall (so a
@@ -108,31 +130,41 @@ function midiToFrequency(midi: number): number {
 }
 
 /** Ramps an AudioParam to `value` by `targetTime`, explicitly pinning its
- *  current (possibly still-ramping) value at `now` first. Reading `.value`
- *  and re-asserting it with `setValueAtTime` before the ramp is what makes
- *  this safe to call repeatedly in quick succession (every pointer move, or
- *  a corner arriving mid-crossfade) without relying on `cancelAndHoldAtTime`
- *  support: a bare `cancelScheduledValues` alone does not guarantee the
- *  param holds its current interpolated value, which is what produced
- *  audible zipper/steps under rapid successive calls. */
+ *  current (possibly still-ramping) value at `now` first, then holding flat
+ *  until `now + SCHEDULING_LOOKAHEAD_SECONDS` before the ramp actually
+ *  starts. The hold-flat step is what gives the audio render thread
+ *  guaranteed lead time to enqueue the change (see SCHEDULING_LOOKAHEAD_SECONDS
+ *  above) without producing any audible jump, since the held value is
+ *  identical to what the param was already doing. Reading `.value` and
+ *  re-asserting it before the ramp is what makes this safe to call
+ *  repeatedly in quick succession (every pointer move, or a corner arriving
+ *  mid-crossfade) without relying on `cancelAndHoldAtTime` support: a bare
+ *  `cancelScheduledValues` alone does not guarantee the param holds its
+ *  current interpolated value, which is what produced audible zipper/steps
+ *  under rapid successive calls. */
 function rampParam(param: AudioParam, value: number, now: number, targetTime: number): void {
   const current = param.value;
+  const scheduledNow = now + SCHEDULING_LOOKAHEAD_SECONDS;
   param.cancelScheduledValues(now);
   param.setValueAtTime(current, now);
-  param.linearRampToValueAtTime(value, targetTime);
+  param.setValueAtTime(current, scheduledNow);
+  param.linearRampToValueAtTime(value, targetTime + SCHEDULING_LOOKAHEAD_SECONDS);
 }
 
-/** Same safe cancel-then-reassert pattern as `rampParam`, but decays
- *  exponentially toward `floor` instead of linearly to an exact target —
- *  used for pointer-release, where a natural decaying tail (not a visibly
- *  linear cut) is the point. `setTargetAtTime` only approaches `floor`
- *  asymptotically; the caller schedules cleanup a fixed time later rather
- *  than waiting for an exact-equality target that will never arrive. */
+/** Same safe cancel-then-reassert-then-lookahead pattern as `rampParam`, but
+ *  decays exponentially toward `floor` instead of linearly to an exact
+ *  target — used for pointer-release, where a natural decaying tail (not a
+ *  visibly linear cut) is the point. `setTargetAtTime` only approaches
+ *  `floor` asymptotically; the caller schedules cleanup a fixed time later
+ *  rather than waiting for an exact-equality target that will never
+ *  arrive. */
 function releaseParam(param: AudioParam, floor: number, now: number, timeConstant: number): void {
   const current = param.value;
+  const scheduledNow = now + SCHEDULING_LOOKAHEAD_SECONDS;
   param.cancelScheduledValues(now);
   param.setValueAtTime(current, now);
-  param.setTargetAtTime(floor, now, timeConstant);
+  param.setValueAtTime(current, scheduledNow);
+  param.setTargetAtTime(floor, scheduledNow, timeConstant);
 }
 
 type VoiceRole = "current" | "fading";
@@ -186,6 +218,19 @@ export class AudioEngine {
       this.masterGain = masterGain;
       this.masterHighpass = masterHighpass;
       this.lfoOsc = lfoOsc;
+
+      // Dev-only diagnostic (stripped from production by Vite's
+      // `import.meta.env.DEV` inlining, same as main.ts): logs every
+      // AudioContext state transition. On Mac Safari specifically, this is
+      // what would reveal repeated suspend/resume or an `interrupted` state
+      // as the actual cause of a corner-to-audio delay, rather than
+      // guessing at one.
+      if (import.meta.env.DEV) {
+        context.addEventListener("statechange", () => {
+          // eslint-disable-next-line no-console
+          console.debug(`[timing] AudioContext state -> ${context.state} at performance.now()=${performance.now().toFixed(2)}`);
+        });
+      }
     }
     if (this.context.state === "suspended") {
       void this.context.resume();
@@ -201,31 +246,41 @@ export class AudioEngine {
     return this.activeVoices.length;
   }
 
-  /** Begins sustaining a chord from silence (pointer-down). Any leftover
-   *  voices from an incomplete previous release are cut short first — this
-   *  should not normally happen, since release only starts on pointer-up. */
+  /** Begins sustaining a chord from silence (pointer-down): a gentle fade-in
+   *  (GESTURE_START_ATTACK_SECONDS), distinct from the fast attack a
+   *  mid-gesture corner gets in changeChord(). Any leftover voices from an
+   *  incomplete previous release are cut short first — this should not
+   *  normally happen, since release only starts on pointer-up. */
   startChord(event: ChordEvent): void {
     if (!this.context || !this.masterHighpass) return;
     for (const voice of this.activeVoices.filter((v) => v.role === "current")) {
       this.fadeOutVoice(voice, STEAL_FADE_SECONDS);
     }
     const preset = presetFor(event.ensemble);
-    for (const note of event.notes) this.createVoice(note, preset, ATTACK_SECONDS);
+    for (const note of event.notes) this.createVoice(note, preset, GESTURE_START_ATTACK_SECONDS);
   }
 
   /** Crossfades from the currently-sustaining chord to a new one (a
-   *  confirmed corner). The incoming chord is made audible fast
-   *  (INCOMING_ATTACK_SECONDS) while the outgoing chord lingers longer
-   *  (OUTGOING_FADE_SECONDS) — the two durations are deliberately different,
-   *  not one shared "crossfade" window (see the constants' comments). The
-   *  incoming chord also gets a guaranteed presence floor so a momentary dip
-   *  in speed-driven volume right at the turn can't silence the very thing
-   *  announcing the corner. */
+   *  confirmed corner), scheduled directly and synchronously off
+   *  `context.currentTime` — never behind a React render, effect,
+   *  `setTimeout`, `requestAnimationFrame`, or promise. The incoming chord
+   *  is made audible fast (INCOMING_ATTACK_SECONDS) while the outgoing
+   *  chord lingers longer (OUTGOING_FADE_SECONDS) — the two durations are
+   *  deliberately different, not one shared "crossfade" window (see the
+   *  constants' comments). The incoming chord also gets a guaranteed
+   *  presence floor so a momentary dip in speed-driven volume right at the
+   *  turn can't silence the very thing announcing the corner. */
   changeChord(event: ChordEvent): void {
     if (!this.context || !this.masterHighpass) return;
     if (this.activeVoices.every((v) => v.role !== "current")) {
       this.startChord(event);
       return;
+    }
+    if (import.meta.env.DEV) {
+      // eslint-disable-next-line no-console
+      console.debug(
+        `[timing] audio engine received chord at performance.now()=${performance.now().toFixed(2)}, context.currentTime=${this.context.currentTime.toFixed(4)}, scheduled start=${(this.context.currentTime + SCHEDULING_LOOKAHEAD_SECONDS).toFixed(4)}`,
+      );
     }
     for (const voice of this.activeVoices.filter((v) => v.role === "current")) {
       this.fadeOutVoice(voice, OUTGOING_FADE_SECONDS);
@@ -274,6 +329,7 @@ export class AudioEngine {
     this.stealOldestIfAtCap();
 
     const now = context.currentTime;
+    const startAt = now + SCHEDULING_LOOKAHEAD_SECONDS;
 
     const oscillator = context.createOscillator();
     oscillator.type = preset.oscillatorType;
@@ -288,8 +344,8 @@ export class AudioEngine {
     levelGain.gain.value = levelOverride ?? this.currentLevel;
 
     const envelopeGain = context.createGain();
-    envelopeGain.gain.setValueAtTime(0, now);
-    envelopeGain.gain.linearRampToValueAtTime(VOICE_RELATIVE_GAIN[note.voice], now + attackSeconds);
+    envelopeGain.gain.setValueAtTime(0, startAt);
+    envelopeGain.gain.linearRampToValueAtTime(VOICE_RELATIVE_GAIN[note.voice], startAt + attackSeconds);
 
     const vibratoScaleGain = context.createGain();
     vibratoScaleGain.gain.value = this.currentVibratoIntensity * preset.vibratoCents;
@@ -304,7 +360,7 @@ export class AudioEngine {
       vibratoScaleGain.connect(oscillator.detune);
     }
 
-    oscillator.start(now);
+    oscillator.start(startAt);
 
     this.activeVoices.push({
       oscillator,
@@ -327,7 +383,7 @@ export class AudioEngine {
     // or fully sustained) and ramp smoothly from there — never a jump to 0.
     rampParam(voice.envelopeGain.gain, 0, now, now + fadeSeconds);
 
-    const stopAt = now + fadeSeconds + 0.02;
+    const stopAt = now + fadeSeconds + SCHEDULING_LOOKAHEAD_SECONDS + 0.02;
     try {
       voice.oscillator.stop(stopAt);
     } catch {
@@ -358,7 +414,7 @@ export class AudioEngine {
     const now = context.currentTime;
     releaseParam(voice.envelopeGain.gain, RELEASE_FLOOR, now, RELEASE_TIME_CONSTANT_SECONDS);
 
-    const stopAt = now + RELEASE_SECONDS;
+    const stopAt = now + RELEASE_SECONDS + SCHEDULING_LOOKAHEAD_SECONDS;
     try {
       voice.oscillator.stop(stopAt);
     } catch {
@@ -389,7 +445,7 @@ export class AudioEngine {
     const now = context.currentTime;
     rampParam(oldest.envelopeGain.gain, 0, now, now + STEAL_FADE_SECONDS);
     try {
-      oldest.oscillator.stop(now + STEAL_FADE_SECONDS + 0.01);
+      oldest.oscillator.stop(now + STEAL_FADE_SECONDS + SCHEDULING_LOOKAHEAD_SECONDS + 0.01);
     } catch {
       // already scheduled to stop — nothing to do.
     }

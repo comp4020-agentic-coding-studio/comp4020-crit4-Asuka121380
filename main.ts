@@ -88,18 +88,28 @@ if (
       const level = speedToLevel(frame.speed);
       audioEngine.setExpression(level, frame.vibratoIntensity);
       if (frame.chordChangeTriggered) {
-        // Dev-only timing check for the corner→audio path: `import.meta.env.DEV`
+        // Dev-only timing breakdown for the corner→audio path: `import.meta.env.DEV`
         // is inlined to `false` by Vite in a production build, so this whole
-        // branch is dead-code-eliminated from the shipped bundle — used to
-        // confirm the confirmation→invocation leg is same-tick, not shipped
-        // as permanent diagnostics.
-        const confirmedAt = import.meta.env.DEV ? performance.now() : 0;
+        // branch is dead-code-eliminated from the shipped bundle. Broken into
+        // stages (rather than one start/end measurement) so a real Mac/Safari
+        // retest can show exactly which leg — harmony selection, event
+        // construction, or the audio engine call itself — accounts for any
+        // remaining delay, instead of only knowing the total.
+        const cornerConfirmedAt = import.meta.env.DEV ? performance.now() : 0;
         harmonicState = sampleNextState(harmonicState, random);
+        const harmonySelectedAt = import.meta.env.DEV ? performance.now() : 0;
         currentEvent = buildCurrentEvent();
+        const eventBuiltAt = import.meta.env.DEV ? performance.now() : 0;
         audioEngine.changeChord(currentEvent);
         if (import.meta.env.DEV) {
+          const audioInvokedAt = performance.now();
           // eslint-disable-next-line no-console
-          console.debug(`[timing] corner confirmed -> changeChord invoked: ${(performance.now() - confirmedAt).toFixed(2)}ms`);
+          console.debug(
+            `[timing] corner confirmed -> harmony selected: ${(harmonySelectedAt - cornerConfirmedAt).toFixed(2)}ms, ` +
+              `event built: ${(eventBuiltAt - harmonySelectedAt).toFixed(2)}ms, ` +
+              `audio engine invoked: ${(audioInvokedAt - eventBuiltAt).toFixed(2)}ms, ` +
+              `total: ${(audioInvokedAt - cornerConfirmedAt).toFixed(2)}ms`,
+          );
         }
         visualizer.showChord(currentEvent);
       }

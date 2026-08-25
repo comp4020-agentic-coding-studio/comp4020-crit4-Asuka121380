@@ -2,11 +2,13 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   AudioEngine,
   CORNER_PRESENCE_FLOOR,
+  GESTURE_START_ATTACK_SECONDS,
   INCOMING_ATTACK_SECONDS,
   MAX_ACTIVE_VOICES,
   OUTGOING_FADE_SECONDS,
   RELEASE_FLOOR,
   RELEASE_SECONDS,
+  SCHEDULING_LOOKAHEAD_SECONDS,
   speedToLevel,
 } from "../audio";
 import { buildChordEvent } from "../chordEvent";
@@ -101,6 +103,8 @@ class FakeAudioContext {
   resume() {
     return Promise.resolve();
   }
+  addEventListener() {}
+  removeEventListener() {}
 }
 
 let originalAudioContext: unknown;
@@ -220,7 +224,7 @@ describe("AudioEngine: sustained pointer-lifecycle voices", () => {
     // The oscillator is scheduled to stop only once the full release tail
     // has had time to become inaudible, not stopped immediately.
     expect(voice.oscillator.stopScheduledAt).not.toBeNull();
-    expect(voice.oscillator.stopScheduledAt as number).toBeCloseTo(RELEASE_SECONDS);
+    expect(voice.oscillator.stopScheduledAt as number).toBeCloseTo(RELEASE_SECONDS + SCHEDULING_LOOKAHEAD_SECONDS);
   });
 
   it("on a confirmed corner, the incoming chord becomes audible much faster than the outgoing chord fades", () => {
@@ -242,12 +246,54 @@ describe("AudioEngine: sustained pointer-lifecycle voices", () => {
       (c) => c.method === "linearRampToValueAtTime" && c.value > 0,
     )!;
 
-    expect(incomingRamp.time).toBeCloseTo(INCOMING_ATTACK_SECONDS);
-    expect(outgoingRamp.time).toBeCloseTo(OUTGOING_FADE_SECONDS);
+    // Every scheduled time carries the same forward lookahead (see
+    // SCHEDULING_LOOKAHEAD_SECONDS in audio.ts) on top of its nominal
+    // duration — this is what gives the audio render thread guaranteed lead
+    // time to enqueue the change.
+    expect(incomingRamp.time).toBeCloseTo(INCOMING_ATTACK_SECONDS + SCHEDULING_LOOKAHEAD_SECONDS);
+    expect(outgoingRamp.time).toBeCloseTo(OUTGOING_FADE_SECONDS + SCHEDULING_LOOKAHEAD_SECONDS);
     // The incoming chord must reach full amplitude well before the outgoing
     // one has faded out — this is what makes the harmony change read as
     // immediate rather than gradually crossfading in under the old chord.
     expect(incomingRamp.time as number).toBeLessThan(outgoingRamp.time as number);
+  });
+
+  it("begins a brand-new gesture with a slower, gentler attack than a mid-gesture corner change", () => {
+    const engine = new AudioEngine();
+    engine.ensureContext();
+    engine.startChord(chordEvent("C"));
+
+    const internals = engine as unknown as {
+      activeVoices: Array<{ envelopeGain: { gain: FakeAudioParam } }>;
+    };
+    const [voice] = internals.activeVoices;
+    const startRamp = voice.envelopeGain.gain.calls.find(
+      (c) => c.method === "linearRampToValueAtTime" && c.value > 0,
+    )!;
+
+    // Envelope A (gesture-start) and envelope B (corner change) are
+    // independent configurations — the gesture-start attack must not equal,
+    // and must be well slower than, the fast corner-change attack.
+    expect(startRamp.time).toBeCloseTo(GESTURE_START_ATTACK_SECONDS + SCHEDULING_LOOKAHEAD_SECONDS);
+    expect(GESTURE_START_ATTACK_SECONDS).toBeGreaterThan(INCOMING_ATTACK_SECONDS);
+  });
+
+  it("schedules new automation a small lookahead ahead of currentTime, never exactly at it", () => {
+    const engine = new AudioEngine();
+    engine.ensureContext();
+    engine.startChord(chordEvent("C"));
+
+    const internals = engine as unknown as {
+      activeVoices: Array<{ envelopeGain: { gain: FakeAudioParam } }>;
+    };
+    const [voice] = internals.activeVoices;
+    const zeroPin = voice.envelopeGain.gain.calls.find((c) => c.method === "setValueAtTime" && c.value === 0)!;
+
+    // The fake context's currentTime is 0 for the whole test, so any
+    // scheduled time greater than 0 is evidence a lookahead was applied
+    // rather than scheduling flush against "now".
+    expect(zeroPin.time).toBeCloseTo(SCHEDULING_LOOKAHEAD_SECONDS);
+    expect(zeroPin.time as number).toBeGreaterThan(0);
   });
 
   it("guarantees the incoming chord a minimum presence even if speed-driven volume had dipped", () => {
