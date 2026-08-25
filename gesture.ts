@@ -72,6 +72,24 @@ export const VIBRATO_AMBIGUOUS_MAX_INTENSITY = 0.15;
 export const CORNER_REARM_DISTANCE_PX = SEGMENT_LENGTH_PX;
 export const CHORD_CHANGE_COOLDOWN_MS = 150;
 
+// If neither the incoming nor the outgoing corner window has been jointly
+// stable (both clearing SEGMENT_STRAIGHTNESS_MIN_RATIO at once) for this much
+// cumulative travel, the buffered path history is treated as stale: it is
+// discarded and a fresh incoming baseline has to be re-established from
+// scratch (see discardStaleHistory()). Without this, a genuinely irregular
+// stretch (a tight scribble, a hand-jittery circle, a rejected candidate)
+// leaves oddly-shaped points sitting in the window indefinitely; the window
+// keeps sliding forward regardless, so it can eventually straddle the
+// boundary between that old irregular tail and unrelated later movement and,
+// purely by coincidence, read as a straight-enough pair of segments — firing
+// a "delayed" corner that has nothing to do with the gesture the user is
+// currently drawing. A smooth circle or curve never reaches this bound (each
+// window stays individually stable throughout, just with a small turn
+// angle), and ordinary corner formation resolves within roughly
+// SEGMENT_LENGTH_PX*2 — so this is set well above that, at *4, to only catch
+// sustained instability rather than the normal in-flight pivot search.
+export const STALE_HISTORY_RESET_DISTANCE_PX = SEGMENT_LENGTH_PX * 4;
+
 // Curve/jitter discrimination (diagnostic labeling only — never gates
 // whether a corner fires). A window is split into this many equal-distance
 // sub-chords; consecutive sub-chord headings that keep turning the same way
@@ -195,6 +213,10 @@ export class GestureAnalyzer {
   // and suppressing the first corner of an unrelated later gesture — see
   // reset() below.
   private lastChangeAt = -Infinity;
+  // cumDist as of the last sample where both corner windows were jointly
+  // stable at once (see STALE_HISTORY_RESET_DISTANCE_PX above). Drives
+  // discardStaleHistory().
+  private lastResolvedDist = 0;
   private axisSign = 0;
   private reversalTimes: number[] = [];
   private vibratoIntensity = 0;
@@ -236,6 +258,7 @@ export class GestureAnalyzer {
     this.activeAxis = null;
     this.lastConfirmedPivotDist = -Infinity;
     this.lastChangeAt = -Infinity;
+    this.lastResolvedDist = 0;
     this.axisSign = 0;
     this.reversalTimes = [];
     this.vibratoIntensity = 0;
@@ -309,6 +332,18 @@ export class GestureAnalyzer {
     const outgoingLength = end.cumDist - pivot.cumDist;
     const incomingStable = this.isStableSegment(incomingStart, pivot);
     const outgoingStable = this.isStableSegment(pivot, end);
+
+    if (incomingStable && outgoingStable) {
+      this.lastResolvedDist = this.totalDist;
+    } else if (this.totalDist - this.lastResolvedDist > STALE_HISTORY_RESET_DISTANCE_PX) {
+      this.discardStaleHistory();
+      this.diagnostics = {
+        ...NO_DIAGNOSTICS,
+        phase: "collectingIncomingSegment",
+        detail: `${STALE_HISTORY_RESET_DISTANCE_PX}px traveled with no jointly-stable segment pair — discarding buffered history and starting a fresh incoming baseline`,
+      };
+      return false;
+    }
 
     if (!incomingStable) {
       const ratio = this.segmentRatio(incomingStart, pivot);
@@ -527,6 +562,24 @@ export class GestureAnalyzer {
     while (this.points.length > 1 && this.points[0].cumDist < cutoff) {
       this.points.shift();
     }
+  }
+
+  // Forgets everything except the current pointer position, so a rejected
+  // candidate or irregular stretch can never later blend with unrelated
+  // movement to produce a delayed corner: after this call, interpolating any
+  // pre-reset distance returns null ("not enough travel yet"), forcing a
+  // genuinely fresh SEGMENT_LENGTH_PX*2 incoming+outgoing pair to accumulate
+  // before a corner can be considered again. The axis lock and in-flight
+  // vibrato state are reset alongside the points buffer for the same reason
+  // — they were derived from the same stale geometry.
+  private discardStaleHistory(): void {
+    const last = this.points[this.points.length - 1];
+    this.points = last ? [last] : [];
+    this.activeAxis = null;
+    this.axisSign = 0;
+    this.reversalTimes = [];
+    this.vibratoIntensity = 0;
+    this.lastResolvedDist = this.totalDist;
   }
 
   private processReversal(t: number, dx: number, dy: number): void {

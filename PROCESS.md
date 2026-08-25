@@ -729,3 +729,129 @@ caught and corrected as part of getting `pnpm check` fully green.
 - Deployment (see below) and the user's manual retest are the next and final
   steps for this round; per standing instruction, no further tuning or
   notation/UI work proceeds until that retest comes back.
+
+## Gesture classification fix: stale-history recovery after a rejected/irregular candidate
+
+Time-boxed corrective pass (~25 min), scoped strictly to the reported "stuck,
+then delayed" chord-change behaviour. No thresholds were broadly loosened, no
+test architecture was expanded beyond the four tests the brief asked for, and
+no other gesture behaviour was touched.
+
+### Root cause
+
+Verified with the existing `getDiagnostics()` API (not assumed): before this
+fix, `detectCorner()`'s incoming/outgoing SEGMENT_LENGTH_PX windows are
+recomputed every sample from whatever is still sitting in the raw `points`
+buffer, and a failed stability check (`!incomingStable`/`!outgoingStable`) did
+nothing but return `false` — it never discarded anything. The only thing that
+ever aged points out of the buffer was `trimPoints()`'s passive, fixed
+`SEGMENT_LENGTH_PX*3` (90px) distance cutoff, which trims for memory, not for
+correctness, and has no notion of "this history was part of a
+rejected/unstable candidate."
+
+A quick trace (via a scratch `_debug.test.ts`, since deleted per "no large
+diagnostic framework") of a short-legged same-axis scrub followed by a clean
+turn showed the mechanism directly: while both windows kept failing the
+straightness gate, every sample reported `reason: "jitter"`/`"curve"` with
+`triggered: false` — a silent, unresponsive stretch from the user's point of
+view. Nothing in that stretch was ever discarded, so the *same* contaminated
+points kept being re-evaluated, sample after sample, until enough new travel
+happened to independently push them past the passive 90px trim window. If the
+tail of that irregular stretch and the start of an unrelated later movement
+were locally straight enough, in combination, to clear
+`SEGMENT_STRAIGHTNESS_MIN_RATIO=0.92` by coincidence, the resulting corner
+would use a heading blended from two unrelated pieces of motion — which is
+exactly the "several shapes, no response, then a sudden late change" the user
+described. This matches the user's own hypothesis; the cooldown constants
+(`CHORD_CHANGE_COOLDOWN_MS`, `CORNER_REARM_DISTANCE_PX`) were checked and
+ruled out — both are no-ops before any corner has ever fired in a gesture,
+which is exactly the situation the report describes (several *non*-corner
+shapes drawn first).
+
+### The fix: an explicit stale-history reset
+
+Added `STALE_HISTORY_RESET_DISTANCE_PX = SEGMENT_LENGTH_PX * 4` (120px) and a
+`lastResolvedDist` field. Every `detectCorner()` call now records the
+cumulative distance of the most recent sample where *both* the incoming and
+outgoing windows were jointly stable at once (regardless of what they were
+then classified as — corner, curve, or axis-reversal all count as
+"resolved", since in every one of those cases the geometry is internally
+straight, just possibly not corner-shaped). If instead a window is
+unstable and more than 120px has passed since the last such resolution, the
+buffered history is treated as stale:
+
+```ts
+if (incomingStable && outgoingStable) {
+  this.lastResolvedDist = this.totalDist;
+} else if (this.totalDist - this.lastResolvedDist > STALE_HISTORY_RESET_DISTANCE_PX) {
+  this.discardStaleHistory();
+  ...
+  return false;
+}
+```
+
+`discardStaleHistory()` drops every buffered point except the current pointer
+position, and also resets `activeAxis`, `axisSign`, `reversalTimes`, and
+`vibratoIntensity` — all of it was derived from the same stale geometry, so
+none of it should carry forward into the fresh baseline. This is the
+"forget stale/rejected candidate history and begin establishing a fresh
+incoming baseline" mechanism the brief asked for, rather than a broader
+threshold change.
+
+### How stale points are prevented from firing later
+
+After a reset, `interpolateAtDistance()` cannot resolve any distance older
+than the single retained point — it returns `null`, which `detectCorner()`
+already treats as "not enough travel yet" (`reason: "insufficient-data"`).
+So a corner literally cannot be evaluated using any pre-reset geometry: the
+detector is forced to accumulate a full fresh `SEGMENT_LENGTH_PX*2` (60px) of
+new, independently-stable travel before it will consider a candidate again.
+A rejected/unstable candidate can therefore never later combine with an
+unrelated movement's points — by the time any classification runs again, the
+old points are gone from the buffer entirely, not merely aged out on a
+schedule that happened not to matter.
+
+120px (4×) was chosen deliberately above the ~60-90px that ordinary corner
+formation and gentle curves take to resolve (both stay individually stable
+throughout — see the existing circle/S-curve/arc tests — so they update
+`lastResolvedDist` every sample and never approach the bound). Threshold
+values (`SEGMENT_STRAIGHTNESS_MIN_RATIO=0.92`, `SEGMENT_LENGTH_PX=30`) were
+left untouched, per the brief's stated preference for a recovery rule over
+lowering thresholds.
+
+### Targeted tests added (`spec/gesture.test.ts`, describe block "GestureAnalyzer: stale-history recovery")
+
+1. Tight, hand-jittery circle (radius small enough to genuinely fail the
+   straightness gate, unlike the large-radius arc tests) then a clean
+   right-angle corner: circle fires 0, corner fires exactly 1, within the
+   corner's own two-segment window (not after burning through most of the
+   outgoing leg).
+2. Repeated same-axis vibrato (realistic leg length, matching the existing
+   vibrato tests) then a clear corner: vibrato fires 0, corner fires exactly
+   1 — a direct regression guard, since ordinary vibrato with legs longer
+   than `SEGMENT_LENGTH_PX` resolves every sample and never needs the new
+   reset path.
+3. Jagged, non-axis-aligned noise (decorrelated direction every step) then a
+   fresh straight baseline and corner: noise fires 0, and the one corner
+   trigger lands promptly in the new baseline, not delayed by leftover noise
+   geometry.
+4. A legitimately rejected candidate (a 40° bend, under
+   `CORNER_ANGLE_MIN_DEG`, classified "continuing straight") followed by
+   unrelated later movement and a real corner: exactly 1 trigger overall,
+   and it's attributable to the later corner, not a revival of the earlier
+   bend.
+
+All four pass, and all 33 pre-existing gesture tests (sharp corners, curves,
+S-curves, full circles, vibrato, density/speed invariance, cooldown/rearm)
+remain green with no parameter changes — `pnpm check`: **9 test files, 120
+tests passing**, `tsc --noEmit` clean, `vite build` succeeds.
+
+One design note worth recording: an early draft of test 2 deliberately used
+vibrato legs *shorter* than `SEGMENT_LENGTH_PX` to stress the new reset path
+harder. That variant failed — not because the fix is wrong, but because
+legs shorter than the corner window mean no 30px stretch of the scrub is
+ever internally stable in the first place, so a corner immediately following
+it genuinely cannot resolve an incoming segment until 30px of clean travel
+exists *purely* in the new direction (60px total including the outgoing
+side). That's correct, conservative behaviour, not a bug, so the test was
+rewritten to use realistic leg lengths instead of chasing that edge case.

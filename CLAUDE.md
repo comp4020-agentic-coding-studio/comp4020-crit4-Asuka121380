@@ -295,6 +295,23 @@ here and wire it into `check`. Growing this file is the work.
     the stability/angle classification boundary and could rarely misfire.
     This was not loosened away, since doing so reopens the "smooth curve
     triggers a chord" complaint this model exists to fix.
+  - **Stale-history recovery**: a failed stability check alone does nothing
+    but return `false` — the windows are recomputed fresh from the buffered
+    `points` array every sample. But if `SEGMENT_STRAIGHTNESS_MIN_RATIO`
+    stays unmet on *both* windows for more than `STALE_HISTORY_RESET_DISTANCE_PX`
+    (120px = `SEGMENT_LENGTH_PX*4`) of travel since the last time they were
+    jointly stable, `discardStaleHistory()` drops every buffered point except
+    the current pointer position and resets `activeAxis`/vibrato state too.
+    This exists so a rejected candidate or a genuinely irregular stretch
+    (tight scribble, jittery circle) can never later blend with an unrelated
+    movement's points into a "delayed" corner — after a reset,
+    `interpolateAtDistance` cannot resolve any pre-reset distance, so a fresh
+    `SEGMENT_LENGTH_PX*2` of independently-stable travel must accumulate
+    before a candidate is considered again. Ordinary corner formation and
+    smooth curves never approach the 120px bound (each window stays
+    individually stable throughout a curve, just with a small turn angle, so
+    it keeps re-marking itself "resolved" every sample). See `PROCESS.md`'s
+    "stale-history recovery" section for the diagnosed root cause.
   - **Diagnostics** (`getDiagnostics()`, dev-only console output gated behind
     `import.meta.env.DEV`): reports an explicit `phase`
     (`collectingIncomingSegment`/`candidateTurn`/`confirmingOutgoingSegment`/

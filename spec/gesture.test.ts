@@ -7,6 +7,7 @@ import {
   GestureAnalyzer,
   MAX_INSTANTANEOUS_SPEED_PX_S,
   SEGMENT_LENGTH_PX,
+  STALE_HISTORY_RESET_DISTANCE_PX,
   type GestureDiagnostics,
   type GestureFrame,
 } from "../gesture";
@@ -517,5 +518,103 @@ describe("GestureAnalyzer: diagnostics", () => {
     expect(d?.axisDifferenceDeg).not.toBeNull();
     expect(d!.headingDifferenceDeg!).toBeCloseTo(90, 0);
     expect(d!.axisDifferenceDeg!).toBeCloseTo(90, 0);
+  });
+});
+
+describe("GestureAnalyzer: stale-history recovery", () => {
+  // A tight, hand-jittery loop: small enough radius that the local
+  // straightness ratio repeatedly fails (unlike the large-radius arcs above,
+  // which stay individually stable throughout, just with a small turn
+  // angle) — this is the "irregular movement" the recovery rule targets.
+  // Looped enough that the unstable stretch comfortably exceeds
+  // STALE_HISTORY_RESET_DISTANCE_PX.
+  function tightLoop(start: Pose, loops = 3): { points: Array<[number, number, number]>; end: Pose } {
+    const circumference = 2 * Math.PI * 15;
+    const steps = Math.ceil((circumference * loops) / 6);
+    return arcRun(start, steps, 15, 1, 6, 15);
+  }
+
+  it("draws a circle then a clean corner: the circle fires nothing and the corner fires exactly once, promptly", () => {
+    const analyzer = new GestureAnalyzer();
+    const circle = tightLoop({ t: 0, x: 0, y: 0, headingDeg: 0 });
+    const circleFrames = [[0, 0, 0] as [number, number, number], ...circle.points].map(([t, x, y]) => analyzer.addSample(t, x, y));
+    expect(corners(circleFrames)).toBe(0);
+
+    const incoming = straightRun(circle.end, 12, 8, 15, 0, 0);
+    const outgoing = straightRun({ ...incoming.end, headingDeg: circle.end.headingDeg + 90 }, 12, 8, 15, 0, 12);
+    const cornerFrames = [...incoming.points, ...outgoing.points].map(([t, x, y]) => analyzer.addSample(t, x, y));
+
+    expect(corners(cornerFrames)).toBe(1);
+    // "Without excessive extra travel": the trigger must land within the
+    // corner's own two-segment window, not require burning through most of
+    // the outgoing leg while stale circle geometry ages out on its own.
+    const triggerIndex = cornerFrames.findIndex((f) => f.chordChangeTriggered);
+    expect(triggerIndex).toBeGreaterThanOrEqual(0);
+    expect(triggerIndex).toBeLessThan(incoming.points.length + Math.ceil(SEGMENT_LENGTH_PX / 8) + 2);
+  });
+
+  it("performs repeated same-axis vibrato, then a clear corner: vibrato fires nothing and the corner fires exactly once", () => {
+    const analyzer = new GestureAnalyzer();
+    const scrub = backAndForthRun(0, 6);
+    const scrubFrames = scrub.points.map(([t, x, y]) => analyzer.addSample(t, x, y));
+    expect(corners(scrubFrames)).toBe(0);
+
+    const turn = straightRun({ ...scrub.end, headingDeg: scrub.end.headingDeg + 90 }, 16);
+    const turnFrames = turn.points.map(([t, x, y]) => analyzer.addSample(t, x, y));
+    expect(corners(turnFrames)).toBe(1);
+  });
+
+  it("feeds irregular noisy movement, then establishes a new straight baseline and corner: no delayed chord originates from the old points", () => {
+    const analyzer = new GestureAnalyzer();
+    // Jagged, non-axis-aligned noise — large enough swings, in inconsistent
+    // directions, that the straightness gate fails throughout (not a gentle
+    // curve, not a clean same-axis reversal either).
+    const noisePoints: Array<[number, number, number]> = [[0, 0, 0]];
+    let t = 0;
+    let x = 0;
+    let y = 0;
+    for (let i = 1; i <= 40; i++) {
+      t += 15;
+      const angle = ((i * 137) % 360) * (Math.PI / 180); // decorrelated direction each step
+      x += Math.cos(angle) * 9;
+      y += Math.sin(angle) * 9;
+      noisePoints.push([t, x, y]);
+    }
+    const noiseFrames = noisePoints.map(([pt, px, py]) => analyzer.addSample(pt, px, py));
+    expect(corners(noiseFrames)).toBe(0);
+
+    const incoming = straightRun({ t, x, y, headingDeg: 0 }, 12, 8, 15, 0, 0);
+    const outgoing = straightRun({ ...incoming.end, headingDeg: 90 }, 12, 8, 15, 0, 12);
+    const cornerFrames = [...incoming.points, ...outgoing.points].map(([pt, px, py]) => analyzer.addSample(pt, px, py));
+
+    expect(corners(cornerFrames)).toBe(1);
+    const triggerIndex = cornerFrames.findIndex((f) => f.chordChangeTriggered);
+    expect(triggerIndex).toBeLessThan(incoming.points.length + Math.ceil(SEGMENT_LENGTH_PX / 8) + 2);
+  });
+
+  it("never fires a rejected candidate later, using its points, after unrelated later movement", () => {
+    const analyzer = new GestureAnalyzer();
+    // A gentle bend, well under CORNER_ANGLE_MIN_DEG — a legitimately
+    // rejected candidate (classified "continuing straight"/"curve"), not an
+    // unstable one.
+    const first = straightRun({ t: 0, x: 0, y: 0, headingDeg: 0 }, 20);
+    const bend = straightRun({ ...first.end, headingDeg: 40 }, 20);
+    const rejectedFrames = [...first.points, ...bend.points].map(([t, x, y]) => analyzer.addSample(t, x, y));
+    expect(corners(rejectedFrames)).toBe(0);
+
+    // Unrelated later movement in a completely different, clean direction.
+    const later = straightRun({ ...bend.end, headingDeg: 40 }, 20);
+    const laterCorner = straightRun({ ...later.end, headingDeg: 40 + 90 }, 20);
+    const laterFrames = [...later.points, ...laterCorner.points].map(([t, x, y]) => analyzer.addSample(t, x, y));
+
+    expect(corners(laterFrames)).toBe(1);
+    // The one trigger belongs to the later corner, not a revival of the
+    // earlier rejected 40° bend.
+    const triggerIndex = laterFrames.findIndex((f) => f.chordChangeTriggered);
+    expect(triggerIndex).toBeGreaterThanOrEqual(later.points.length - 2);
+  });
+
+  it("keeps the stale-history reset bound comfortably above ordinary corner-formation travel", () => {
+    expect(STALE_HISTORY_RESET_DISTANCE_PX).toBeGreaterThan(SEGMENT_LENGTH_PX * 2);
   });
 });
