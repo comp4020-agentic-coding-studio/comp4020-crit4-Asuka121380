@@ -3,31 +3,38 @@
 // against synthetic pointer traces, not just judged by feel.
 
 /** Rolling window used to average out per-sample noise before estimating the
- *  current movement axis. */
-export const DIRECTION_WINDOW_MS = 100;
+ *  current movement axis. Tuned down from an initial 100ms — a clear L-turn
+ *  was reading as sluggish (~500ms corner-to-chord latency) at that width. */
+export const DIRECTION_WINDOW_MS = 60;
 
 /** Per-step motion below this is ignored entirely (hand jitter, not a gesture). */
 export const NOISE_DISTANCE_PX = 3;
 
 /** Axis change past this angle (degrees, on the 0-90 mod-π scale) starts a
  *  candidate corner. */
-export const CORNER_CANDIDATE_DEG = 40;
+export const CORNER_CANDIDATE_DEG = 32;
 
 /** Axis change back below this cancels a pending candidate — the hand drifted
  *  back toward the original axis rather than committing to a turn. */
-export const CORNER_CANCEL_DEG = 20;
+export const CORNER_CANCEL_DEG = 16;
 
 /** Distance the candidate axis must hold once past the angle threshold. */
-export const CONFIRM_DISTANCE_PX = 24;
+export const CONFIRM_DISTANCE_PX = 14;
 
 /** Time the candidate axis must hold once past the angle threshold. */
-export const CONFIRM_TIME_MS = 75;
+export const CONFIRM_TIME_MS = 40;
 
 /** Minimum gap between two confirmed chord changes. */
-export const CHORD_CHANGE_COOLDOWN_MS = 150;
+export const CHORD_CHANGE_COOLDOWN_MS = 90;
 
 /** Exponential smoothing time constant for the speed estimate. */
 export const SPEED_SMOOTHING_MS = 60;
+
+/** A single instantaneous speed sample above this is treated as an
+ *  event-rate/coalescing spike (a burst of pointer events reporting an
+ *  implausible jump) and clamped before it reaches the EMA, so one glitchy
+ *  sample can't punch a visible jump through the smoothed speed. */
+export const MAX_INSTANTANEOUS_SPEED_PX_S = 4000;
 
 /** A same-axis direction flip below this amplitude is jitter, not vibrato. */
 export const MIN_REVERSAL_PX = 6;
@@ -87,7 +94,7 @@ export class GestureAnalyzer {
         const dx = x - this.prev.x;
         const dy = y - this.prev.y;
         const distance = Math.hypot(dx, dy);
-        const instantaneousSpeed = distance / (dt / 1000);
+        const instantaneousSpeed = Math.min(distance / (dt / 1000), MAX_INSTANTANEOUS_SPEED_PX_S);
         const alpha = 1 - Math.exp(-dt / SPEED_SMOOTHING_MS);
         this.smoothedSpeed += (instantaneousSpeed - this.smoothedSpeed) * alpha;
 

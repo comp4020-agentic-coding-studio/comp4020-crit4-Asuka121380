@@ -132,17 +132,34 @@ here and wire it into `check`. Growing this file is the work.
   accumulate — see `spec/audio.test.ts`'s "keeps at most one crossfading-out
   generation alive" test.
 - **Chord lifecycle is pointer-driven, not timed**: `AudioEngine.startChord`
-  (pointer-down, quick attack), `.changeChord` (confirmed corner, ~130ms
-  crossfade between outgoing and incoming chords), `.releaseChord`
-  (pointer-up, ~300ms release). `.setExpression(level, vibratoIntensity)` is
+  (pointer-down, quick attack), `.changeChord` (confirmed corner, ~100ms
+  crossfade between outgoing and incoming chords, started immediately from
+  `context.currentTime` — never a delayed timer), `.releaseChord`
+  (pointer-up, ~400ms release). `.setExpression(level, vibratoIntensity)` is
   called on every pointer move and only ever touches the *currently
   sustaining* chord's voices — a chord already fading out keeps its own
   envelope undisturbed.
+- **Every gain ramp goes through a shared `rampParam` helper, not a bare
+  `linearRampToValueAtTime`.** It reads the AudioParam's current (possibly
+  still-interpolating) value, re-asserts it with `setValueAtTime(current,
+  now)`, then ramps — this is what makes it safe to call repeatedly in quick
+  succession (every pointer move, or a corner landing mid-crossfade) without
+  audible zipper/steps. Do not call `cancelAndHoldAtTime`/
+  `cancelScheduledValues` directly on a voice's gain elsewhere in this file —
+  a bare `cancelScheduledValues` does not reliably hold the in-flight value
+  across browsers, which is exactly what made an earlier version of pointer-
+  release feel abrupt.
 - **Speed-to-volume mapping lives in `audio.ts`'s `speedToLevel`** (a pure,
   directly-tested function): below `SPEED_FLOOR_PX_S` the level is a held
   minimum (never silent while holding still), above `SPEED_CEILING_PX_S` it's
-  full volume, linear in between. Gain changes are applied via
-  `linearRampToValueAtTime` ~60ms out to avoid zipper noise.
+  full volume, linear in between. The resulting level is applied
+  asymmetrically in `setExpression` — a faster ramp (~50ms) when volume is
+  rising than when it's falling (~100ms), since a momentary dip in the
+  smoothed speed reading otherwise reads as a stutter. `gesture.ts` also
+  clamps any single instantaneous speed sample above
+  `MAX_INSTANTANEOUS_SPEED_PX_S` before it reaches the EMA, so one
+  event-rate/coalescing glitch can't punch a spike through the smoothed
+  speed the volume is driven from.
 - **Vibrato is one shared LFO oscillator (sine, ~5.5Hz), never stopped once
   created**, fanned out through a per-voice gain node (`vibratoScaleGain`)
   into each oscillator's `detune` AudioParam. `GestureAnalyzer` tracks
@@ -152,14 +169,20 @@ here and wire it into `check`. Growing this file is the work.
   Strings ±14) per voice, every pointer move.
 - **Axis-based corner detection replaces distance-triggered chord changes.**
   `gesture.ts`'s axis angle is computed mod 180° (a line and its opposite
-  direction are the same axis), a rolling ~100ms window smooths noisy
-  instantaneous direction, and a candidate axis must both exceed a ~40°
-  deviation from the locked axis *and* hold for ~24px/~75ms before it's
-  confirmed as a corner (a ~150ms cooldown then guards against a second
-  immediate re-trigger). This is a pure, DOM-free module — `spec/gesture.test.ts`
-  drives it with synthetic pointer traces (straight lines, jitter, reversals,
-  clean corners, cooldown, gentle curves) rather than requiring a human to
-  judge gesture sensitivity by feel for every change.
+  direction are the same axis), a rolling ~60ms window smooths noisy
+  instantaneous direction, and a candidate axis must both exceed a ~32°
+  deviation from the locked axis *and* hold for ~14px/~40ms before it's
+  confirmed as a corner (a ~90ms cooldown then guards against a second
+  immediate re-trigger). These thresholds were tuned down from an initial
+  wider set (100ms/40°/24px/75ms/150ms) after a first listening pass reported
+  ~500ms of felt latency between a clear turn and the harmony actually
+  changing — corner-to-chord response is a feel checkpoint, not something to
+  get right on the first guess. This is a pure, DOM-free module —
+  `spec/gesture.test.ts` drives it with synthetic pointer traces (straight
+  lines, jitter, reversals, clean corners, cooldown, gentle curves, an
+  explicit corner-latency-under-150ms assertion, an isolated speed-spike
+  clamp) rather than requiring a human to judge gesture sensitivity by feel
+  for every change.
 - **Master gain is 0.22, plus a ~36Hz master high-pass filter** to remove
   unnecessary sub-bass energy — chosen and checked on this machine's laptop
   speakers/headphones only. **A real-phone listening pass has not yet been

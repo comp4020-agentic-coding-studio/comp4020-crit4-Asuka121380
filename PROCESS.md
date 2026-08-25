@@ -137,21 +137,81 @@ and baton/visual-reference work are still pending and are the next slice.
    single-toggle ensemble button themselves are unchanged for now; their
    removal/replacement is part of the still-pending notation/UI slice.
 
-## Verification status (honest, as of this refinement)
+## Verification status after the first shipped refinement
 
-- `pnpm check` is green: **9 test files, 82 tests passing**, including new
+- `pnpm check` was green: **9 test files, 82 tests passing**, including new
   suites for `gesture.ts` (axis/corner/vibrato, all synthetic-trace-driven)
   and the rewritten `audio.ts` (sustained-voice lifecycle, cap-under-stress,
   crossfade-generation limits), plus additions to `spec/voicing.test.ts`
   (exact-G7 voicing, `diatonicStep`/`parsePitchName` behaviour).
-- **Not yet done**: any real-browser or real-device listening/gesture pass
-  on this refined audio/gesture model — the balance table, the
-  speed-to-volume feel, corner sensitivity, and vibrato depth are all only
-  verified against synthetic fakes so far, not by ear or by hand. Notation
-  rendering (an SVG score replacing the old fading-dot lanes), the two
-  ensemble icon buttons, Clear-button removal, and the baton/visual-reference
-  restyle are not yet built.
-- Next: commit and deploy this slice, verify the live URL serves it, then
-  stop and ask for a human listening/gesture pass at the checkpoints named
-  in the refinement prompt (balance/clarity, speed-to-volume, corner
-  sensitivity, vibrato depth) before starting the notation/UI slice.
+- This was deployed and the live URL was verified to serve the updated
+  bundle. A human listening/gesture pass then reported three feel issues
+  (see below) — none of which any of the above tests could have caught,
+  since they're about *timing feel*, not correctness of the state machine.
+
+## Tuning pass: corner latency, release smoothness, volume response
+
+A real listening/gesture pass on the deployed refinement reported three
+concrete problems, each addressed directly:
+
+1. **Corner-to-chord latency was ~500ms — too slow to feel responsive.**
+   `gesture.ts`'s direction-window and corner-confirmation thresholds were
+   tuned down: `DIRECTION_WINDOW_MS` 100→60, `CORNER_CANDIDATE_DEG` 40→32,
+   `CORNER_CANCEL_DEG` 20→16 (kept at half the candidate angle),
+   `CONFIRM_DISTANCE_PX` 24→14, `CONFIRM_TIME_MS` 75→40,
+   `CHORD_CHANGE_COOLDOWN_MS` 150→90 — a clear L-turn now confirms within a
+   bounded, tested latency (`spec/gesture.test.ts` asserts under 150ms from
+   the start of the new heading), while the existing jitter/gentle-curve
+   tests (unchanged) still pass at the tighter thresholds, confirming the
+   detector didn't just get twitchier along with faster. `audio.ts`'s
+   crossfade window was also tightened (130ms→100ms) since `changeChord`
+   already started the incoming chord immediately from
+   `context.currentTime` — the latency was entirely in gesture confirmation,
+   not audio scheduling, which is worth having actually checked rather than
+   assumed.
+2. **Pointer release read as abrupt.** The release path already preserved
+   gain and ramped rather than cutting, but relied on
+   `cancelAndHoldAtTime`/`cancelScheduledValues` directly, which doesn't
+   reliably hold an in-flight ramping value across browsers. Replaced with a
+   shared `rampParam` helper used everywhere a voice's gain is ramped
+   (release, crossfade-out, cap-steal): it reads the param's current value,
+   re-asserts it with `setValueAtTime`, then ramps — a defensive pattern that
+   doesn't depend on `cancelAndHoldAtTime` support. Release duration went
+   130ms→400ms (crossfade stayed short; release is the one that should feel
+   like a tail, not a cut). A new test asserts the ramp-to-zero call is
+   immediately preceded by a `setValueAtTime` reasserting the pre-release
+   gain (not 0), and that the oscillator's `stop()` is scheduled for a later
+   time, not called for "now."
+3. **Speed-to-volume still felt jumpy.** Two causes, both fixed: (a)
+   `setExpression` was issuing a bare `linearRampToValueAtTime` on every
+   pointer move without cancelling the previous move's still-pending ramp,
+   so overlapping automation events could produce a sawtooth-like volume
+   under rapid movement — fixed by routing through the same `rampParam`
+   helper. (b) volume response is now asymmetric: rising faster (~50ms) than
+   falling (~100ms), so a momentary dip in the smoothed speed reading (hand
+   pausing mid-gesture) doesn't read as a stutter. A test drives
+   `setExpression` with a rise then a fall and asserts the fall's scheduled
+   ramp target is later (slower) than the rise's. Separately, `gesture.ts`
+   now clamps any single instantaneous speed sample above
+   `MAX_INSTANTANEOUS_SPEED_PX_S` before it reaches the EMA, so one
+   event-rate/coalescing glitch can't punch a spike through the smoothed
+   speed the volume is driven from — tested by injecting one wildly
+   out-of-place sample into an otherwise steady trace and confirming the
+   smoothed speed neither exceeds the clamp nor stays pinned near it once
+   normal movement resumes.
+
+## Verification status (honest, as of this tuning pass)
+
+- `pnpm check` is green: **9 test files, 86 tests passing** (4 new: corner
+  latency bound, speed-spike clamp, release-preserves-gain, asymmetric
+  rise/fall ramp targets).
+- **Not yet done**: a second real-device listening/gesture pass confirming
+  these three fixes actually feel right — the new tests check the mechanism
+  (ramp sequencing, latency bound, clamp behaviour) against synthetic fakes,
+  not the felt result on a phone. Notation rendering, the two ensemble icon
+  buttons, Clear-button removal, and the baton/visual-reference restyle are
+  still not built.
+- Next: deploy this tuning pass, verify the live URL, then ask for a second
+  listening/gesture checkpoint (sharp corner, gentle curve, jitter,
+  slow-to-fast, fast-to-slow, release at low and high volume) before
+  starting the notation/UI slice.

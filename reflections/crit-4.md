@@ -59,3 +59,45 @@ per-voice balance, the speed curve, the corner sensitivity, the vibrato
 depth — actually feel right to a person conducting with their hand, on a
 phone speaker, rather than to a synthetic pointer trace on a laptop. That's
 still waiting on a real listening pass.
+
+## After the first real listening pass
+
+That listening pass came back, and it was useful precisely because it
+surfaced things no synthetic test could: corner-to-chord latency read as
+"roughly half a second," pointer release felt abrupt, and speed-to-volume
+still felt jumpy. None of my `gesture.test.ts`/`audio.test.ts` suites flagged
+any of this, because they were built to check the *state machine's logic* —
+does a corner fire once, does the cap hold, is the axis math right — not
+*how it feels in time*. That's a distinction I want to hold onto: a green
+test suite proves the mechanism does what I told it to do; it says nothing
+about whether what I told it to do is the right target. Timing/feel
+parameters (latency thresholds, ramp durations, response asymmetry) are a
+different category of thing from correctness, and they need a human in the
+loop by construction — no amount of additional synthetic testing before
+shipping would have caught "this feels slow," because "feels slow" isn't a
+property of the code, it's a property of the code plus a nervous system.
+
+Investigating the abrupt-release complaint also surfaced a subtler point:
+the release code already *looked* like it was doing the right thing —
+preserving gain, ramping instead of cutting — and technically it mostly was.
+The actual gap was in a browser-compatibility corner (`cancelAndHoldAtTime`
+support and behavior varies) that a fake `AudioContext` in a test can't
+expose, because the fake doesn't have divergent implementations to be
+inconsistent between. That's a real limit of the fake-graph testing strategy
+this whole build has leaned on: it verifies the *shape* of the calls I make,
+not whether real engines interpret those calls the way I expect. I addressed
+it by not depending on the ambiguous API at all (reading `.value` and
+re-asserting it explicitly before every ramp) rather than by trying to test
+around the ambiguity — sometimes the fix for "my test can't see this bug" is
+to remove the code path the test can't see, not to write a cleverer test.
+
+Once this second pass comes back, the honest move if it's still not right is
+the same as it was the first time: report exactly what's still off, tune the
+specific constant it points at, and ask again — rather than guessing at a
+"probably good enough" set of numbers and moving on to the notation/UI work
+the brief explicitly said not to let this block. The instruction to stop and
+ask at named checkpoints (balance/clarity, speed-to-volume, corner
+sensitivity, vibrato depth) rather than compressing rounds "until it seems
+right" isn't formality — it's how a feel property with no test actually gets
+verified: by trading with a real listener across as many rounds as it takes,
+not by getting to a checkpoint once and assuming it stuck.

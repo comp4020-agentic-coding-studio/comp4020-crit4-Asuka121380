@@ -8,21 +8,27 @@ import { voiceChord } from "../voicing";
 // AudioContext — enough to observe node creation and gain-envelope calls
 // without needing real audio hardware. Real click-free/level/balance checks
 // still need a human listening pass (see PROCESS.md / reflections/crit-4.md).
+type ParamCall = { method: string; value: number; time?: number };
+
 class FakeAudioParam {
   value = 0;
-  setValueAtTime(v: number) {
+  calls: ParamCall[] = [];
+  setValueAtTime(v: number, t?: number) {
     this.value = v;
+    this.calls.push({ method: "setValueAtTime", value: v, time: t });
     return this;
   }
-  linearRampToValueAtTime(v: number) {
+  linearRampToValueAtTime(v: number, t?: number) {
     this.value = v;
+    this.calls.push({ method: "linearRampToValueAtTime", value: v, time: t });
     return this;
   }
   setTargetAtTime(v: number) {
     this.value = v;
     return this;
   }
-  cancelScheduledValues() {
+  cancelScheduledValues(t?: number) {
+    this.calls.push({ method: "cancelScheduledValues", value: 0, time: t });
     return this;
   }
   cancelAndHoldAtTime() {
@@ -51,12 +57,15 @@ class FakeOscillatorNode extends FakeAudioNode {
   type = "sawtooth";
   frequency = new FakeAudioParam();
   detune = new FakeAudioParam();
+  stopScheduledAt: number | null = null;
   private endedListeners: Array<() => void> = [];
   start() {}
   // Deliberately does NOT fire 'ended' — real hardware only fires it once
   // playback time is reached, well after `.stop()` is scheduled, so tests
   // that need cleanup to have happened call `fireEnded()` explicitly.
-  stop() {}
+  stop(t?: number) {
+    this.stopScheduledAt = t ?? null;
+  }
   fireEnded() {
     for (const fn of this.endedListeners) fn();
   }
@@ -169,6 +178,57 @@ describe("AudioEngine: sustained pointer-lifecycle voices", () => {
   it("does not throw when applying continuous expression with no chord sustaining", () => {
     const engine = new AudioEngine();
     expect(() => engine.setExpression(0.5, 0.3)).not.toThrow();
+  });
+
+  it("on release, preserves the current gain and ramps down instead of jumping to zero", () => {
+    const engine = new AudioEngine();
+    engine.ensureContext();
+    engine.startChord(chordEvent("C"));
+    const internals = engine as unknown as {
+      activeVoices: Array<{ oscillator: FakeOscillatorNode; envelopeGain: { gain: FakeAudioParam } }>;
+    };
+    const [voice] = internals.activeVoices;
+    const gainBeforeRelease = voice.envelopeGain.gain.value;
+    expect(gainBeforeRelease).toBeGreaterThan(0);
+
+    engine.releaseChord();
+
+    // The ramp must start from the value the chord already had, not 0 — the
+    // last setValueAtTime call before the final ramp-to-zero should re-assert
+    // that same value rather than resetting it.
+    const calls = voice.envelopeGain.gain.calls;
+    const rampToZeroIndex = calls.findIndex((c) => c.method === "linearRampToValueAtTime" && c.value === 0);
+    expect(rampToZeroIndex).toBeGreaterThan(0);
+    const precedingSetValue = calls[rampToZeroIndex - 1];
+    expect(precedingSetValue.method).toBe("setValueAtTime");
+    expect(precedingSetValue.value).toBeCloseTo(gainBeforeRelease);
+
+    // The oscillator is scheduled to stop later, not stopped immediately.
+    expect(voice.oscillator.stopScheduledAt).not.toBeNull();
+    expect(voice.oscillator.stopScheduledAt as number).toBeGreaterThan(0);
+  });
+
+  it("ramps volume up faster than it ramps volume down", () => {
+    const engine = new AudioEngine();
+    engine.ensureContext();
+    engine.startChord(chordEvent("C"));
+    const internals = engine as unknown as {
+      activeVoices: Array<{ levelGain: { gain: FakeAudioParam } }>;
+    };
+    const [voice] = internals.activeVoices;
+
+    engine.setExpression(0.95, 0); // a rise from the initial held-minimum level
+    const riseCalls = voice.levelGain.gain.calls.filter((c) => c.method === "linearRampToValueAtTime");
+    const riseTarget = riseCalls[riseCalls.length - 1].time ?? 0;
+
+    engine.setExpression(0.1, 0); // a fall back down
+    const fallCalls = voice.levelGain.gain.calls.filter((c) => c.method === "linearRampToValueAtTime");
+    const fallTarget = fallCalls[fallCalls.length - 1].time ?? 0;
+
+    // Both ramps are scheduled from the same `now` (the fake context's
+    // currentTime never advances), so a larger target time means a longer
+    // (slower) ramp.
+    expect(fallTarget).toBeGreaterThan(riseTarget);
   });
 });
 

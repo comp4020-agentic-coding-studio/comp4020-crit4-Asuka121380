@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { GestureAnalyzer, type GestureFrame } from "../gesture";
+import { GestureAnalyzer, MAX_INSTANTANEOUS_SPEED_PX_S, type GestureFrame } from "../gesture";
 
 function run(points: Array<[number, number, number]>): GestureFrame[] {
   const analyzer = new GestureAnalyzer();
@@ -95,6 +95,39 @@ describe("GestureAnalyzer: axis and corner detection", () => {
       points.push([t, x, y]);
     }
     expect(corners(run(points))).toBe(2);
+  });
+
+  it("confirms a clear L-turn quickly rather than half a second later", () => {
+    const points = straightLine(20); // establish the x-axis
+    const turnStartT = points[points.length - 1][0];
+    const turnStartX = points[points.length - 1][1];
+    for (let i = 1; i <= 20; i++) {
+      points.push([turnStartT + i * 15, turnStartX, i * 8]);
+    }
+    const frames = run(points);
+    const turnStartIndex = 21; // first sample belonging to the new heading
+    const triggerIndex = frames.findIndex((f, idx) => idx >= turnStartIndex && f.chordChangeTriggered);
+    expect(triggerIndex).toBeGreaterThan(-1);
+    const latencyMs = points[triggerIndex][0] - turnStartT;
+    expect(latencyMs).toBeLessThan(150);
+  });
+
+  it("clamps an isolated speed spike instead of letting one glitchy sample dominate", () => {
+    const analyzer = new GestureAnalyzer();
+    let frame: GestureFrame | undefined;
+    for (let i = 0; i <= 20; i++) frame = analyzer.addSample(i * 15, i * 8, 0);
+    const steadySpeed = frame!.speed;
+
+    // A single wildly out-of-place jump (simulating a coalesced/burst event).
+    const spikeFrame = analyzer.addSample(20 * 15 + 15, 20 * 8 + 4000, 0);
+    expect(spikeFrame.speed).toBeLessThanOrEqual(MAX_INSTANTANEOUS_SPEED_PX_S);
+
+    // Resuming the normal cadence settles the smoothed speed back down
+    // quickly rather than staying pinned near the spike.
+    for (let i = 1; i <= 5; i++) {
+      frame = analyzer.addSample(20 * 15 + 15 + i * 15, 20 * 8 + 4000 + i * 8, 0);
+    }
+    expect(frame!.speed).toBeLessThan(steadySpeed * 5);
   });
 
   it("does not burst-fire repeatedly on a single gentle curve", () => {

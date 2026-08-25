@@ -12,9 +12,20 @@ const MASTER_GAIN = 0.22;
 const MASTER_HIGHPASS_HZ = 36;
 
 const ATTACK_SECONDS = 0.05;
-const CROSSFADE_SECONDS = 0.13;
-const RELEASE_SECONDS = 0.3;
+// A confirmed corner starts the new chord immediately (from
+// `context.currentTime`, never a delayed timer) and crossfades the outgoing
+// chord out over this same window.
+const CROSSFADE_SECONDS = 0.1;
+// Pointer-up preserves whatever gain the chord was already at and fades to
+// silence over this window before the oscillators are stopped/disconnected —
+// never a direct-to-zero cut.
+const RELEASE_SECONDS = 0.4;
 const STEAL_FADE_SECONDS = 0.03;
+// Continuous speed-to-volume response is asymmetric: quicker to rise (a
+// sudden increase in speed should be heard right away) than to fall (so a
+// momentary dip in the smoothed speed doesn't read as a stutter).
+const LEVEL_RISE_SECONDS = 0.05;
+const LEVEL_FALL_SECONDS = 0.1;
 const EXPRESSION_SMOOTHING_SECONDS = 0.06;
 const VIBRATO_RATE_HZ = 5.5;
 
@@ -72,6 +83,21 @@ function presetFor(ensemble: Ensemble): Preset {
 
 function midiToFrequency(midi: number): number {
   return 440 * 2 ** ((midi - 69) / 12);
+}
+
+/** Ramps an AudioParam to `value` by `targetTime`, explicitly pinning its
+ *  current (possibly still-ramping) value at `now` first. Reading `.value`
+ *  and re-asserting it with `setValueAtTime` before the ramp is what makes
+ *  this safe to call repeatedly in quick succession (every pointer move, or
+ *  a corner arriving mid-crossfade) without relying on `cancelAndHoldAtTime`
+ *  support: a bare `cancelScheduledValues` alone does not guarantee the
+ *  param holds its current interpolated value, which is what produced
+ *  audible zipper/steps under rapid successive calls. */
+function rampParam(param: AudioParam, value: number, now: number, targetTime: number): void {
+  const current = param.value;
+  param.cancelScheduledValues(now);
+  param.setValueAtTime(current, now);
+  param.linearRampToValueAtTime(value, targetTime);
 }
 
 type VoiceRole = "current" | "fading";
@@ -182,13 +208,20 @@ export class AudioEngine {
    *  its own envelope, undisturbed. */
   setExpression(level: number, vibratoIntensity: number): void {
     if (!this.context) return;
+    const now = this.context.currentTime;
+    // Rising and falling volume get different response times (see
+    // LEVEL_RISE_SECONDS/LEVEL_FALL_SECONDS above) — compare against the
+    // level already in effect, not the raw input, since `level` already
+    // includes the held-minimum floor from `speedToLevel`.
+    const levelSmoothingSeconds = level >= this.currentLevel ? LEVEL_RISE_SECONDS : LEVEL_FALL_SECONDS;
+    const levelTarget = now + levelSmoothingSeconds;
+    const vibratoTarget = now + EXPRESSION_SMOOTHING_SECONDS;
     this.currentLevel = level;
     this.currentVibratoIntensity = vibratoIntensity;
-    const target = this.context.currentTime + EXPRESSION_SMOOTHING_SECONDS;
     for (const voice of this.activeVoices) {
       if (voice.role !== "current") continue;
-      voice.levelGain.gain.linearRampToValueAtTime(level, target);
-      voice.vibratoScaleGain.gain.linearRampToValueAtTime(vibratoIntensity * voice.maxVibratoCents, target);
+      rampParam(voice.levelGain.gain, level, now, levelTarget);
+      rampParam(voice.vibratoScaleGain.gain, vibratoIntensity * voice.maxVibratoCents, now, vibratoTarget);
     }
   }
 
@@ -248,13 +281,9 @@ export class AudioEngine {
     voice.role = "fading";
 
     const now = context.currentTime;
-    const gainParam = voice.envelopeGain.gain;
-    if (typeof gainParam.cancelAndHoldAtTime === "function") {
-      gainParam.cancelAndHoldAtTime(now);
-    } else {
-      gainParam.cancelScheduledValues(now);
-    }
-    gainParam.linearRampToValueAtTime(0, now + fadeSeconds);
+    // Preserve whatever gain this voice is already at (mid-attack, mid-crossfade,
+    // or fully sustained) and ramp smoothly from there — never a jump to 0.
+    rampParam(voice.envelopeGain.gain, 0, now, now + fadeSeconds);
 
     const stopAt = now + fadeSeconds + 0.02;
     try {
@@ -285,13 +314,7 @@ export class AudioEngine {
     this.activeVoices.shift();
 
     const now = context.currentTime;
-    const gainParam = oldest.envelopeGain.gain;
-    if (typeof gainParam.cancelAndHoldAtTime === "function") {
-      gainParam.cancelAndHoldAtTime(now);
-    } else {
-      gainParam.cancelScheduledValues(now);
-    }
-    gainParam.linearRampToValueAtTime(0, now + STEAL_FADE_SECONDS);
+    rampParam(oldest.envelopeGain.gain, 0, now, now + STEAL_FADE_SECONDS);
     try {
       oldest.oscillator.stop(now + STEAL_FADE_SECONDS + 0.01);
     } catch {
