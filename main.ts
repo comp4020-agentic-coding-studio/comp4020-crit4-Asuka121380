@@ -3,8 +3,8 @@ import { buildChordEvent, type ChordEvent } from "./chordEvent";
 import { INITIAL_STATE, sampleChordSymbol, sampleNextState, type HarmonicState } from "./harmony";
 import { ConductingController } from "./interaction";
 import { mulberry32 } from "./rng";
-import { voiceChord, type Ensemble, type Voice } from "./voicing";
-import { ChordVisualizer } from "./visualization";
+import { voiceChord, type Ensemble } from "./voicing";
+import { ScoreRenderer } from "./score";
 
 const surface = document.querySelector<HTMLElement>("#conducting-surface");
 const baton = document.querySelector<HTMLElement>("#baton");
@@ -13,14 +13,7 @@ const invitation = document.querySelector<HTMLElement>("#invitation");
 const statusRegion = document.querySelector<HTMLElement>("#status");
 const ensembleBrassButton = document.querySelector<HTMLButtonElement>("#ensemble-brass");
 const ensembleStringsButton = document.querySelector<HTMLButtonElement>("#ensemble-strings");
-const resetButton = document.querySelector<HTMLButtonElement>("#reset-button");
-
-const voiceRows: Record<Voice, HTMLElement | null> = {
-  soprano: document.querySelector<HTMLElement>("#lane-soprano"),
-  alto: document.querySelector<HTMLElement>("#lane-alto"),
-  tenor: document.querySelector<HTMLElement>("#lane-tenor"),
-  bass: document.querySelector<HTMLElement>("#lane-bass"),
-};
+const scoreSvg = document.querySelector<SVGSVGElement>("#score-svg");
 
 if (
   surface &&
@@ -30,15 +23,10 @@ if (
   statusRegion &&
   ensembleBrassButton &&
   ensembleStringsButton &&
-  resetButton &&
-  voiceRows.soprano &&
-  voiceRows.alto &&
-  voiceRows.tenor &&
-  voiceRows.bass
+  scoreSvg
 ) {
-  const rows = voiceRows as Record<Voice, HTMLElement>;
   const audioEngine = new AudioEngine();
-  const visualizer = new ChordVisualizer(chordSymbolElement, rows);
+  const scoreRenderer = new ScoreRenderer(scoreSvg, chordSymbolElement);
   const random = mulberry32((Date.now() ^ (Math.random() * 0xffffffff)) >>> 0);
 
   let ensemble: Ensemble = "brass";
@@ -77,7 +65,7 @@ if (
     // immediately, not only on the next corner or the next hold. No-ops
     // (see retimbreChord) when nothing is currently sounding.
     audioEngine.retimbreChord(currentEvent);
-    visualizer.showChord(currentEvent);
+    scoreRenderer.showChord(currentEvent);
   };
 
   const controller = new ConductingController(surface, {
@@ -88,7 +76,7 @@ if (
     onGestureStart: () => {
       audioEngine.ensureContext();
       audioEngine.startChord(currentEvent);
-      visualizer.showChord(currentEvent);
+      scoreRenderer.showChord(currentEvent);
     },
     onGestureMove: (frame) => {
       const level = speedToLevel(frame.speed);
@@ -117,7 +105,7 @@ if (
               `total: ${(audioInvokedAt - cornerConfirmedAt).toFixed(2)}ms`,
           );
         }
-        visualizer.showChord(currentEvent);
+        scoreRenderer.showChord(currentEvent);
       }
     },
     onGestureEnd: () => {
@@ -135,13 +123,6 @@ if (
 
   ensembleBrassButton.addEventListener("click", () => selectEnsemble("brass"));
   ensembleStringsButton.addEventListener("click", () => selectEnsemble("strings"));
-
-  resetButton.addEventListener("click", () => {
-    harmonicState = INITIAL_STATE;
-    currentEvent = buildCurrentEvent();
-    visualizer.showChord(currentEvent);
-    statusRegion.textContent = "Harmony reset.";
-  });
 
   void controller;
 }

@@ -27,13 +27,29 @@
       <div class="controls">
         <div class="ensemble-group" role="group" aria-label="Ensemble">
           <button type="button" id="ensemble-brass" class="ensemble-button" aria-pressed="true">
-            <span class="ensemble-icon" aria-hidden="true">🎺</span> Brass
+            <svg class="ensemble-icon" viewBox="0 0 56 40" aria-hidden="true">
+              <path d="M2,20 L9,20" />
+              <circle class="icon-dot" cx="2" cy="20" r="2.4" />
+              <path d="M9,20 L20,20" />
+              <path d="M22,12 L22,24 M28,10 L28,26 M34,12 L34,24" />
+              <path d="M20,16 L36,16 M20,24 L36,24" />
+              <path d="M36,20 C 42,20 46,14 54,13 M36,20 C 42,20 46,26 54,27" />
+            </svg>
+            <span class="ensemble-label">Brass</span>
           </button>
           <button type="button" id="ensemble-strings" class="ensemble-button" aria-pressed="false">
-            <span class="ensemble-icon" aria-hidden="true">🎻</span> Strings
+            <svg class="ensemble-icon" viewBox="0 0 34 56" aria-hidden="true">
+              <path d="M16,2 C 10,1 8,6 12,8 C 15,9.5 16,6.5 14,5.5" />
+              <line x1="16" y1="3" x2="16" y2="20" />
+              <path d="M9,20 C 6,21 6,26 9,27.5 C 6,29 6,33 9,34" />
+              <path d="M23,20 C 26,21 26,26 23,27.5 C 26,29 26,33 23,34" />
+              <path d="M9,20 C 12,18.5 20,18.5 23,20" />
+              <path d="M9,34 C 6,37 7,45 12,47.5 C 15,49 19,49 22,47.5 C 27,45 28,37 23,34" />
+              <path d="M13,26 C 12,28.5 12.5,31 14,33 M20,26 C 21,28.5 20.5,31 19,33" />
+            </svg>
+            <span class="ensemble-label">Strings</span>
           </button>
         </div>
-        <button type="button" id="reset-button">Clear</button>
       </div>
 
       <p id="status" class="visually-hidden" role="status" aria-live="polite"></p>
@@ -44,34 +60,44 @@
         tabindex="0"
         aria-label="Conducting surface. Press and move to conduct; turn to change harmony."
       >
-        <div class="chord-symbol" id="chord-symbol" aria-hidden="true"></div>
-
-        <div class="instrument-row" data-voice="soprano">
-          <span class="instrument-label">Trumpet / Violin</span>
-          <div class="note-lane" id="lane-soprano"></div>
-        </div>
-        <div class="instrument-row" data-voice="alto">
-          <span class="instrument-label">Horn / Viola</span>
-          <div class="note-lane" id="lane-alto"></div>
-        </div>
-        <div class="instrument-row" data-voice="tenor">
-          <span class="instrument-label">Trombone / Cello</span>
-          <div class="note-lane" id="lane-tenor"></div>
-        </div>
-        <div class="instrument-row" data-voice="bass">
-          <span class="instrument-label">Tuba / Double Bass</span>
-          <div class="note-lane" id="lane-bass"></div>
+        <div class="score-paper">
+          <div class="score-header">
+            <p class="concert-pitch-label">Concert Pitch</p>
+            <div class="chord-symbol" id="chord-symbol" aria-hidden="true"></div>
+          </div>
+          <svg
+            id="score-svg"
+            class="score-svg"
+            viewBox="0 0 620 600"
+            preserveAspectRatio="xMidYMid meet"
+            role="img"
+            aria-label="Conductor's score showing the currently sounding chord"
+          ></svg>
         </div>
 
-        <p class="concert-pitch-label">Concert pitch</p>
-        <div class="baton" id="baton" aria-hidden="true"></div>
+        <div class="baton" id="baton" aria-hidden="true">
+          <svg class="baton-svg" viewBox="0 0 210 40" overflow="visible">
+            <defs>
+              <linearGradient id="baton-shaft-gradient" gradientUnits="userSpaceOnUse" x1="20" y1="20" x2="165" y2="20">
+                <stop offset="0%" stop-color="#FFF9E8" />
+                <stop offset="55%" stop-color="#F3E6C2" />
+                <stop offset="100%" stop-color="#B68A3A" />
+              </linearGradient>
+              <linearGradient id="baton-handle-gradient" x1="0" y1="0" x2="1" y2="0">
+                <stop offset="0%" stop-color="#7D4A23" />
+                <stop offset="100%" stop-color="#3D2113" />
+              </linearGradient>
+            </defs>
+            <circle class="baton-glow" cx="20" cy="20" r="10" />
+            <line class="baton-shaft" x1="20" y1="20" x2="165" y2="20" stroke="url(#baton-shaft-gradient)" />
+            <rect class="baton-handle" x="163" y="14" width="34" height="12" rx="6" fill="url(#baton-handle-gradient)" />
+            <circle class="baton-tip" cx="20" cy="20" r="3" />
+          </svg>
+        </div>
         <p class="invitation" id="invitation">Hold and conduct.</p>
       </section>
 
-      <p class="keyboard-hint">
-        Hold and move to conduct. Turn to change harmony. <kbd>1</kbd> selects Brass,
-        <kbd>2</kbd> selects Strings.
-      </p>
+      <p class="keyboard-hint">Hold and move to conduct &middot; turn to change harmony</p>
     </main>
     <script type="module" src="./main.ts"></script>
   </body>
