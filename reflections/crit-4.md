@@ -151,3 +151,55 @@ reports "still not better," the right first move is not to retune whatever
 constant looks closest to the complaint — it's to ask "did my previous
 explanation of the cause actually get verified, or did it just sound
 plausible at the time," and go re-check that before touching anything else.
+
+## After the cross-device retest
+
+This round's report was the most specific one yet — three devices, five
+numbered symptoms, and an explicit instruction not to reach for the two
+"fixes" that would have been fastest: lowering the corner threshold again,
+or branching on browser name for a Safari-specific delay. Both were ruled
+out for a reason worth restating to myself: a lower threshold trades away
+the discrimination that Windows and mobile were already getting right, and
+a browser-name branch treats a symptom's *platform* as its *cause*, which
+begs the actual question of why Web Audio scheduling would behave
+differently there at all.
+
+The diagnosis that held up was a scheduling-race argument, not a
+measurement — this environment has no real Safari or CoreAudio to render
+against, so "every automation call now schedules from `currentTime + 8ms`
+instead of exactly at `currentTime`" is reported honestly in `PROCESS.md` as
+a structural fix with a specific, falsifiable mechanism (a call scheduled at
+the boundary of the current render quantum can silently defer to the next
+one, which a renderer with a larger quantum would show up as worse), not as
+a confirmed resolution. That distinction — "I changed the code for a reason
+I can defend" versus "I watched the bug go away" — is the same one the
+`cancelAndHoldAtTime` browser-compatibility gap in the previous round taught
+me, applied one level earlier: when the divergent behavior lives in real
+hardware/browser internals a fake graph can't model, the honest deliverable
+is a mechanism plus an instrumented, reproducible measurement path
+(the dev-only `[timing]` breakdown across corner-confirmed →
+harmony-selected → event-built → audio-invoked, plus the `AudioContext`
+`statechange` log), not a claim that the feel problem is solved.
+
+The other thing this round forced was catching my own mistake *before*
+shipping it, rather than after a listening pass caught it for me. Scoring
+corner sharpness needs "how far did the heading actually turn," but the
+codebase already had a heading-difference helper built for a different job —
+detecting an axis-preserving reversal for vibrato — that folds direction mod
+180° on purpose, because for *that* job a line and its opposite are the same
+axis. Reusing it for corner strength would have scored a sharp near-reversal
+V-corner as *weak* (it folds close to 0° near an exact reversal) and a plain
+right angle as *maximum* (90° is the peak of the fold) — backwards from what
+"how sudden is this corner" should mean, and backwards in a way that would
+have been very easy to miss by reading the code, since `toAxisAngleDegrees`
+is a real, well-tested, correctly-named function doing exactly its own job
+correctly. The bug would only have shown up as an inexplicably-shaped test
+failure (a 150° corner scoring below a 90° one) or, worse, as another vague
+"corners feel unreliable" report with no obvious cause in the diff. Writing
+a second, unfolded heading helper for corner detection and keeping the
+folded one scoped strictly to reversal detection — rather than trying to
+make one function serve both — is the same lesson as the polyphony-cap and
+cooldown-reset mistakes from earlier rounds, one step earlier in the
+process: a function whose docstring-in-my-head ("compute how much the
+direction changed") is broader than what it's actually safe to use for is a
+trap that reads as reuse until it isn't.

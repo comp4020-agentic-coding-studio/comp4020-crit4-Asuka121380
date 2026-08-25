@@ -115,9 +115,10 @@ here and wire it into `check`. Growing this file is the work.
   renderer itself is the next piece to land) both driven from the same
   `ChordEvent`. `gesture.ts` (`GestureAnalyzer`) is a pure, DOM-free module
   that turns a raw pointer trace into `{ speed, chordChangeTriggered,
-  vibratoIntensity }` per sample — axis-based corner detection instead of
-  accumulated-distance triggering, same-axis reversal drives vibrato instead
-  of retriggering a chord. `interaction.ts` (`ConductingController`) wires
+  vibratoIntensity }` per sample — stable-segment corner detection (a
+  concentrated turn between two independently-straight runs, not a
+  cumulative-direction-change threshold; see below), same-axis reversal
+  drives vibrato instead of retriggering a chord. `interaction.ts` (`ConductingController`) wires
   pointer lifecycle (down starts sustain, move feeds `gesture.ts` and reports
   baton position/rotation, up releases) plus `1`/`2` keydown shortcuts for
   ensemble selection — this is what keeps the crit-4 "more than one input
@@ -131,29 +132,52 @@ here and wire it into `check`. Growing this file is the work.
   proven in the MVP build) rather than letting a third generation
   accumulate — see `spec/audio.test.ts`'s "keeps at most one crossfading-out
   generation alive" test.
-- **Chord lifecycle is pointer-driven, not timed**: `AudioEngine.startChord`
-  (pointer-down, quick attack), `.changeChord` (confirmed corner — see below),
-  `.releaseChord` (pointer-up, exponential-decay release — see below).
-  `.setExpression(level, vibratoIntensity)` is called on every pointer move
-  and only ever touches the *currently sustaining* chord's voices — a chord
-  already fading out keeps its own envelope undisturbed.
+- **Chord lifecycle has three independent envelope configurations — never
+  share a duration constant across them.** (A) `AudioEngine.startChord`
+  (pointer-down): begins from silence with a gentle
+  `GESTURE_START_ATTACK_SECONDS` (~220ms) attack — applies only to the first
+  chord of a gesture. (B) `.changeChord` (confirmed corner — see below): a
+  fast, asymmetric crossfade. (C) `.releaseChord` (pointer-up): an
+  exponential decay — see below. `.setExpression(level, vibratoIntensity)`
+  is called on every pointer move and only ever touches the *currently
+  sustaining* chord's voices — a chord already fading out keeps its own
+  envelope undisturbed. A cross-device retest treating A and B as
+  interchangeable (or B's shape as "close enough" for A) is exactly the bug
+  this separation exists to prevent — `spec/audio.test.ts` has a dedicated
+  test asserting `GESTURE_START_ATTACK_SECONDS` and
+  `INCOMING_ATTACK_SECONDS` are genuinely different values.
 - **A confirmed corner does NOT use one shared "crossfade" duration for the
   incoming and outgoing chords — that was a real bug, not just a constants
   choice.** The incoming chord ramps in over `INCOMING_ATTACK_SECONDS`
-  (~40ms) while the outgoing one lingers over the separate, longer
-  `OUTGOING_FADE_SECONDS` (~130ms). A single shared ~100ms constant meant the
-  new chord's linear 0→full ramp spent its early portion at low, easily
-  masked amplitude while the still-loud outgoing chord dominated — so the
-  harmony change wasn't perceptually established until close to the full
-  100ms had passed, well after the code had "already" started it. Splitting
-  the two, and biasing the incoming ramp much shorter, is what actually
-  fixes felt latency — tightening `gesture.ts`'s corner-confirmation
-  thresholds further would only have traded discrimination for an illusion
-  of responsiveness, since the corner→`changeChord()` call itself was already
-  same-tick (verified: no React, no `setTimeout`/rAF/Promise anywhere between
-  gesture confirmation and the audio call — this app has no framework at
-  all, `visualization.ts`'s rAF/`setTimeout` only animate a decorative dot
-  *after* audio has already been scheduled).
+  (~35ms) while the outgoing one lingers over the separate, longer
+  `OUTGOING_FADE_SECONDS` (~150ms). A single shared duration meant the new
+  chord's linear 0→full ramp spent its early portion at low, easily masked
+  amplitude while the still-loud outgoing chord dominated — so the harmony
+  change wasn't perceptually established until close to the full ramp had
+  passed, well after the code had "already" started it. Splitting the two,
+  and biasing the incoming ramp much shorter, is what actually fixes felt
+  latency — tightening `gesture.ts`'s corner-confirmation thresholds further
+  would only have traded discrimination for an illusion of responsiveness,
+  since the corner→`changeChord()` call itself was already same-tick
+  (verified: no React, no `setTimeout`/rAF/Promise anywhere between gesture
+  confirmation and the audio call — this app has no framework at all,
+  `visualization.ts`'s rAF/`setTimeout` only animate a decorative dot *after*
+  audio has already been scheduled).
+- **Every automation call schedules from `context.currentTime +
+  SCHEDULING_LOOKAHEAD_SECONDS` (8ms), never from `context.currentTime`
+  directly — this is the fix for Mac/Safari-specific chord-change latency.**
+  Scheduling exactly at "now" races the audio render thread: the requested
+  time can land inside the block already being rendered, silently deferring
+  the change to the next render quantum — more visible on a renderer with a
+  larger quantum, which is consistent with the delay reading as Mac/Safari-
+  specific even though the JS-side gesture→`changeChord()` path is identical
+  on every platform. The lookahead is universal (not a browser check) and
+  is within the brief's explicit "~5-10ms safety offset if necessary"
+  allowance. **Do not "fix" a future latency report by lowering
+  `gesture.ts`'s corner thresholds or by adding a browser-name check** —
+  both were explicitly ruled out once already; if a real device still shows
+  a delay after this, re-measure with the dev-only timing/statechange
+  instrumentation before changing anything.
 - **`changeChord` also guarantees the incoming chord a `CORNER_PRESENCE_FLOOR`
   (~0.5) minimum level**, regardless of the continuously speed-driven
   `currentLevel` at that instant. A hand naturally slows down while pivoting
@@ -165,23 +189,31 @@ here and wire it into `check`. Growing this file is the work.
   speed-to-volume-jumpiness complaints reported after the first tuning pass.
 - **Pointer-release now decays exponentially, not linearly.** `releaseChord`
   calls `releaseVoice`, which holds the chord's current gain and uses
-  `AudioParam.setTargetAtTime(RELEASE_FLOOR, now, RELEASE_TIME_CONSTANT_SECONDS)`
-  (floor `0.0001`, time constant ~170ms, ≈`RELEASE_SECONDS` 850ms total audible
+  `AudioParam.setTargetAtTime(RELEASE_FLOOR, scheduledNow, RELEASE_TIME_CONSTANT_SECONDS)`
+  (floor `0.0001`, time constant ~300ms, ≈`RELEASE_SECONDS` 1.5s total audible
   tail) instead of a fixed-duration `linearRampToValueAtTime` — a visibly
   linear ramp reads as a cut no matter how long it's stretched, where an
   exponential decay reads as an ensemble settling. Oscillators are stopped
-  only once the full `RELEASE_SECONDS` tail has had time to become
-  inaudible, never at the moment the decay is scheduled.
+  only once the full `RELEASE_SECONDS` tail (plus the scheduling lookahead)
+  has had time to become inaudible, never at the moment the decay is
+  scheduled. 1.5s was chosen after a retest reported the previous 0.85s
+  release as still too fast — it's the brief's suggested starting point
+  within its 1.2-1.8s range, not a hard floor.
 - **Every linear gain ramp goes through a shared `rampParam` helper** (used
-  for crossfade/steal/expression, never for release — see above). It reads
-  the AudioParam's current (possibly still-interpolating) value, re-asserts
-  it with `setValueAtTime(current, now)`, then ramps — this is what makes it
-  safe to call repeatedly in quick succession (every pointer move, or a
-  corner landing mid-crossfade) without audible zipper/steps. Do not call
-  `cancelAndHoldAtTime`/`cancelScheduledValues` directly on a voice's gain
-  elsewhere in this file — a bare `cancelScheduledValues` does not reliably
-  hold the in-flight value across browsers. `releaseParam` is the equivalent
-  helper for the exponential release path.
+  for crossfade/steal/expression, never for release — see above); the
+  equivalent exponential-decay helper for release is `releaseParam`. Both
+  read the AudioParam's current (possibly still-interpolating) value,
+  re-assert it with `setValueAtTime(current, now)`, hold it flat through
+  `setValueAtTime(current, now + SCHEDULING_LOOKAHEAD_SECONDS)`, and only
+  then schedule the actual ramp/decay from `now + SCHEDULING_LOOKAHEAD_SECONDS`
+  — the "hold through lookahead" step is what lets every automation call use
+  the lookahead without producing an audible jump in still-ramping
+  automation. This is what makes it safe to call repeatedly in quick
+  succession (every pointer move, or a corner landing mid-crossfade) without
+  audible zipper/steps. Do not call `cancelAndHoldAtTime`/`cancelScheduledValues`
+  directly on a voice's gain elsewhere in this file — a bare
+  `cancelScheduledValues` does not reliably hold the in-flight value across
+  browsers.
 - **Speed-to-volume mapping lives in `audio.ts`'s `speedToLevel`** (a pure,
   directly-tested function): below `SPEED_FLOOR_PX_S` the level is a held
   minimum (never silent while holding still), above `SPEED_CEILING_PX_S` it's
@@ -193,11 +225,12 @@ here and wire it into `check`. Growing this file is the work.
   `MAX_INSTANTANEOUS_SPEED_PX_S` before it reaches the EMA, so one
   event-rate/coalescing glitch can't punch a spike through the smoothed
   speed the volume is driven from. `SPEED_SMOOTHING_MS` (~80ms, the raw-speed
-  EMA) and `DIRECTION_WINDOW_MS` (~75ms, the corner-axis window) are
-  deliberately separate constants — speed-to-volume and corner detection are
-  different signals with different responsiveness needs, and were never
-  actually coupled, but this is called out explicitly so a future change
-  doesn't accidentally merge them.
+  EMA) and `SEGMENT_LENGTH_PX` (30px, the corner-detection stability window —
+  see below) are deliberately separate mechanisms on different units
+  (time vs. distance) — speed-to-volume and corner detection are different
+  signals with different responsiveness needs, and were never actually
+  coupled, but this is called out explicitly so a future change doesn't
+  accidentally merge them.
 - **Vibrato is one shared LFO oscillator (sine, ~5.5Hz), never stopped once
   created**, fanned out through a per-voice gain node (`vibratoScaleGain`)
   into each oscillator's `detune` AudioParam. `GestureAnalyzer` tracks
@@ -205,22 +238,54 @@ here and wire it into `check`. Growing this file is the work.
   locked axis) and reports a decaying `vibratoIntensity` (0-1);
   `setExpression` scales that by the ensemble's max cents (Brass ±6,
   Strings ±14) per voice, every pointer move.
-- **Axis-based corner detection replaces distance-triggered chord changes.**
-  `gesture.ts`'s axis angle is computed mod 180° (a line and its opposite
-  direction are the same axis), a rolling ~60ms window smooths noisy
-  instantaneous direction, and a candidate axis must both exceed a ~32°
-  deviation from the locked axis *and* hold for ~14px/~40ms before it's
-  confirmed as a corner (a ~90ms cooldown then guards against a second
-  immediate re-trigger). These thresholds were tuned down from an initial
-  wider set (100ms/40°/24px/75ms/150ms) after a first listening pass reported
-  ~500ms of felt latency between a clear turn and the harmony actually
-  changing — corner-to-chord response is a feel checkpoint, not something to
-  get right on the first guess. This is a pure, DOM-free module —
-  `spec/gesture.test.ts` drives it with synthetic pointer traces (straight
-  lines, jitter, reversals, clean corners, cooldown, gentle curves, an
-  explicit corner-latency-under-150ms assertion, an isolated speed-spike
-  clamp) rather than requiring a human to judge gesture sensitivity by feel
-  for every change.
+- **Corner detection is a stable-segment model, not a cumulative-direction-
+  change threshold** (`gesture.ts`, fully rewritten during the cross-device
+  round — the old rolling-window/candidate-hysteresis model, and every
+  constant it used, is gone). The old model's actual failure mode: asking
+  "has direction changed enough since the axis was locked" cannot tell a
+  short sharp turn apart from a long gradual arc, since both can accumulate
+  the same total heading change — which is exactly why smooth curves kept
+  triggering false chord changes. The new model instead looks for the
+  concrete shape of a real corner: `stable incoming segment → short turning
+  region → stable outgoing segment`.
+  - A pivot candidate is found by walking back `SEGMENT_LENGTH_PX` (30px, a
+    *distance* window, not a time window) from the latest sample; the
+    incoming segment's start is another `SEGMENT_LENGTH_PX` back from the
+    pivot.
+  - Both the incoming (start→pivot) and outgoing (pivot→end) segments must
+    independently pass `isStableSegment`: straight-line chord length ÷ path
+    length traveled ≥ `SEGMENT_STRAIGHTNESS_MIN_RATIO` (0.92). One ratio
+    check rejects both curvature and in-place jitter/wandering, and needs no
+    DPI scaling since pointer coordinates already arrive in DPI-independent
+    CSS px.
+  - The *true* (0-360°, unfolded) heading difference between the two
+    segments must fall in `[CORNER_ANGLE_MIN_DEG=70, CORNER_ANGLE_MAX_DEG=165]`.
+    **Do not reuse the mod-180 axis-difference helper (`toAxisAngleDegrees`)
+    for this check** — it exists only for the same-axis reversal/vibrato
+    detector, which needs "same line, either direction" semantics. Folding a
+    true heading change mod 180° inverts corner-sharpness scoring near a
+    reversal (a sharp ~150° V-corner folds to a *low* score, a plain 90°
+    turn folds to the *maximum* score) — use the separate unfolded
+    `headingDegrees`/`headingDifference` helpers for corner strength, always.
+    The 165° upper bound is deliberate: an exact reversal is a same-axis
+    wobble, not a corner, and is left to the reversal/vibrato mechanism.
+  - Re-arming a confirmed corner requires the next pivot to be at least
+    `CORNER_REARM_DISTANCE_PX` (30px) further along the path *and*
+    `CHORD_CHANGE_COOLDOWN_MS` (150ms) since the last confirmed corner —
+    both guards, not just one, since the geometry's natural self-limiting
+    tendency alone is tolerance-fragile.
+  - **Known trade-off**: very tight arcs (radius roughly ≲40-60px) sit near
+    the stability/angle classification boundary and could rarely misfire.
+    This was not loosened away, since doing so reopens the "smooth curve
+    triggers a chord" complaint this model exists to fix.
+  - This is a pure, DOM-free module — `spec/gesture.test.ts` drives it with
+    realistic multi-point synthetic pointer traces (straight lines,
+    non-periodic jitter, same-axis reversal, a right-angle corner, a sharp
+    ~150° corner, a corner just above the minimum angle, a large-radius arc
+    at any total sweep, a smooth S-curve, cooldown/re-arm guards, and an
+    explicit "does not fire again while sliding through the same corner's
+    window" case) rather than requiring a human to judge gesture sensitivity
+    by feel for every change.
 - **Master gain is 0.22, plus a ~36Hz master high-pass filter** to remove
   unnecessary sub-bass energy — chosen and checked on this machine's laptop
   speakers/headphones only. **A real-phone listening pass has not yet been

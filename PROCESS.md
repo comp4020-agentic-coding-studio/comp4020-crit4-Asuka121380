@@ -344,3 +344,164 @@ without first confirming where in the pipeline the delay lived.
   while loud, several rapid intentional corners). Notation/UI work remains
   explicitly not started, per their instruction not to begin it until this
   checkpoint passes.
+
+## Cross-device retest: Mac-only latency, envelope separation, corner rework
+
+The third checkpoint came back with a cross-device test (Mac, Windows, phone):
+Windows and mobile were "mostly responsive," but the Mac specifically still
+showed noticeable chord-change latency, plus three feel complaints that
+applied everywhere (release still too fast, gesture-start too abrupt, corner
+detection still too sensitive to smooth curves). The user gave an explicit,
+detailed diagnostic checklist and two hard constraints: don't fix the Mac
+latency by lowering corner-detection thresholds again, and don't add a fixed
+Safari-specific delay without first finding the actual cause. Both are
+respected below — the fix applied everywhere, not branched by browser name.
+
+1. **Diagnosed the Mac-specific latency as a Web Audio scheduling race, not a
+   gesture-confirmation delay.** The previous round already established the
+   corner-confirmation→`changeChord()` leg is same-tick everywhere (no
+   timers, no framework render cycle in this codebase). Every one of this
+   round's automation calls (`rampParam`, `releaseParam`, voice creation,
+   `oscillator.start()`) was scheduling exactly at `context.currentTime`.
+   Scheduling exactly at "now" races the audio render thread: by the time a
+   `setValueAtTime`/`start()` call reaches the renderer, the requested time
+   can already be inside (or just behind) the block currently being
+   rendered, silently deferring the actual change to the next render
+   quantum. That race is inherently more visible on a renderer with a larger
+   render quantum or more scheduling jitter — which is consistent with it
+   reading as Mac/Safari-specific even though nothing about the JS-side path
+   differs between platforms. This is a hypothesis derived from how the Web
+   Audio spec's scheduling model works, not something verifiable from this
+   environment (no real Safari/CoreAudio access here) — it is reported
+   honestly as *diagnosed and structurally addressed*, not *confirmed fixed*,
+   pending the user's own Mac retest.
+2. **Fix: a single, universal 8ms scheduling lookahead (`SCHEDULING_LOOKAHEAD_SECONDS`
+   in `audio.ts`), applied identically on every platform.** Every "now"-based
+   schedule (`rampParam`, `releaseParam`, `createVoice`'s attack/`start()`,
+   `fadeOutVoice`/`releaseVoice`/`stealOldestIfAtCap`'s stop times) now
+   anchors at `context.currentTime + 0.008`, never at `context.currentTime`
+   directly. This is within the user's explicit "~5-10ms safety offset if
+   necessary" allowance, is not a browser check of any kind, and costs
+   nothing perceptually (8ms is far below the ~20-50ms incoming-attack
+   target). `rampParam`/`releaseParam` use a two-step "pin then hold-through-
+   lookahead" pattern — `setValueAtTime(current, now)` then
+   `setValueAtTime(current, now + lookahead)` before the actual
+   ramp/decay — so the lookahead never introduces an audible jump in
+   still-ramping automation (e.g. a corner arriving mid-crossfade).
+3. **Added dev-only diagnostics matching the user's checklist**, gated by
+   `import.meta.env.DEV` (confirmed dead-code-eliminated from the production
+   bundle — see verification below): an `AudioContext` `statechange`
+   listener in `ensureContext()` (surfaces repeated suspend/resume/
+   `interrupted` transitions, one of the user's named suspects); a
+   `changeChord()` entry log comparing `performance.now()` against
+   `context.currentTime` and the lookahead-shifted scheduled start; and
+   `main.ts`'s single corner-confirmed timing log expanded into a four-stage
+   breakdown (corner-confirmed → harmony-selected → event-built → audio-
+   engine-invoked) so a future report can name which leg, if any, still
+   contributes measurable delay on real hardware.
+4. **Separated the three envelope behaviours into fully independent
+   configurations**, replacing the previous shared-ish attack constant:
+   - **A — gesture start** (`GESTURE_START_ATTACK_SECONDS = 0.22`, used only
+     in `startChord`): begins from silence with a gentle ~220ms attack,
+     applying only to the first chord of a new gesture.
+   - **B — mid-gesture corner change** (`INCOMING_ATTACK_SECONDS = 0.035`,
+     `OUTGOING_FADE_SECONDS = 0.15`, used only in `changeChord`): the
+     incoming chord reaches full level in 35ms while the outgoing chord
+     lingers for 150ms — unchanged in kind from the previous round, both
+     values nudged slightly within the brief's 20-50ms/100-180ms ranges.
+   - **C — pointer release** (`RELEASE_SECONDS` 0.85s→**1.5s**,
+     `RELEASE_TIME_CONSTANT_SECONDS` 0.17s→**0.3s**, ≈5 time constants ≈
+     `RELEASE_SECONDS`): extended because the previous round's release,
+     while already exponential rather than linear, still read as "too fast"
+     on retest — 1.5s is the brief's suggested starting point within its
+     1.2-1.8s range. Voice cleanup (`oscillator.stop`) still waits for the
+     full release duration (now including the lookahead) before firing, so
+     nothing is cut short.
+   A new test (`spec/audio.test.ts`: "begins a brand-new gesture with a
+   slower, gentler attack than a mid-gesture corner change") asserts A and B
+   are genuinely different values, not the same constant reused — the exact
+   failure mode this separation is meant to prevent.
+5. **Reimplemented corner detection around a stable-segment model**,
+   replacing the previous rolling-window/candidate-hysteresis approach
+   entirely (`gesture.ts`, fully rewritten). The new model looks for the
+   concrete shape of a real corner — `stable incoming segment → short
+   turning region → stable outgoing segment` — rather than asking whether
+   cumulative direction change since some earlier point exceeds a threshold
+   (the old model's actual failure mode: a long, gradual arc can accumulate
+   the same total heading change as a short sharp turn, so a threshold on
+   accumulated change alone cannot tell them apart).
+   - A small buffer of noise-filtered path points is kept, each annotated
+     with cumulative path distance. A candidate pivot is found by walking
+     back `SEGMENT_LENGTH_PX` (30px) from the latest point; the incoming
+     segment's start is another `SEGMENT_LENGTH_PX` back from the pivot.
+   - **Stability check**: both the incoming (start→pivot) and outgoing
+     (pivot→end) segments must have a straight-line chord length at least
+     `SEGMENT_STRAIGHTNESS_MIN_RATIO` (0.92) of the path length actually
+     traveled across them. This single ratio rejects both curvature
+     (wandering off the chord) and in-place jitter/backtracking (traveling
+     far without displacing) in one check, and needs no device-pixel-ratio
+     scaling since pointer coordinates already arrive in DPI-independent CSS
+     px.
+   - **Angle check**: the *true* (0-360°, unfolded) heading difference
+     between the two stable segments must fall in
+     `[CORNER_ANGLE_MIN_DEG=70, CORNER_ANGLE_MAX_DEG=165]`. The upper bound
+     matters: an exact reversal (180°) is deliberately excluded from corner
+     detection and left to the existing same-axis reversal/vibrato
+     mechanism, which needs "same line, either direction" semantics rather
+     than corner-sharpness semantics — conflating the two would have made a
+     sharp near-reversal V-corner indistinguishable from an out-and-back
+     wobble.
+   - **Re-arming**: a confirmed corner requires the new pivot to be at least
+     `CORNER_REARM_DISTANCE_PX` (30px) further along the path *and*
+     `CHORD_CHANGE_COOLDOWN_MS` (150ms, unchanged) since the last confirmed
+     corner — a distance guard and a time guard together, rather than
+     relying only on the geometry's natural (but tolerance-fragile) tendency
+     to self-limit.
+   - **Design trade-off, disclosed rather than hidden**: very tight arcs
+     (radius roughly ≲40-60px) sit near the classification boundary between
+     "stable segment" and "curve" at this segment length/ratio, and could in
+     rare cases misfire as a corner. This wasn't loosened away because doing
+     so would reopen the "smooth curve triggers a chord change" complaint
+     this round exists to fix; a real conducting gesture's natural arc
+     radius is expected to sit well above this range, and the deployed build
+     is the way to find out if that assumption holds.
+6. **New/updated tests added to `spec/gesture.test.ts`** covering exactly
+   the shapes the user asked for, built from realistic multi-point paths
+   (not idealized 3-point corners): a clean right-angle corner, a sharp
+   acute-angle (150°) corner, a corner just above the minimum angle
+   ("slightly wider but still obvious"), a large-radius circular arc (no
+   trigger, regardless of how far it sweeps — the local-window design means
+   total accumulated heading is irrelevant), a smooth S-curve built from two
+   opposite-direction arcs (no trigger), realistic non-periodic pointer
+   jitter (no trigger), and an explicit "does not fire again while sliding
+   through the same confirmed corner's window" test. Pre-existing tests
+   (straight line, alternating jitter, same-axis reversal, cooldown
+   non-retrigger, two well-separated corners, corner-latency bound,
+   speed-spike clamp, gentle-curve non-burst-fire, stale-cooldown-across-reset)
+   were re-verified passing against the new model, with the corner-latency
+   bound's rationale updated to reflect the new distance-based confirmation
+   mechanism rather than the old time-window one.
+
+### Verification status (honest, as of this cross-device round)
+
+- `pnpm check` is green: **9 test files, 101 tests passing** (11 new since
+  the previous round).
+- **Structurally verified**: dev-only timing/statechange instrumentation is
+  fully absent from the production bundle (grepped the built `dist/assets/*.js`
+  for `"timing"` and `console.debug` — zero hits either way); the gesture-
+  start attack (A) and corner-change attack (B) are distinct constants, not
+  a shared one reused; every automation call schedules from
+  `context.currentTime + SCHEDULING_LOOKAHEAD_SECONDS`, verified by a
+  dedicated test against the fake `AudioContext` (whose `currentTime` never
+  advances, so any scheduled time greater than zero is direct evidence of
+  the lookahead).
+- **Not verified, and not claimed as verified**: whether the scheduling
+  lookahead actually resolves the Mac/Safari latency on real hardware — this
+  environment has no access to real Safari/CoreAudio, so the fix is reported
+  as a diagnosed, structural change with a specific mechanism, not as a
+  confirmed resolution. The user's own Mac retest, together with the new
+  dev-console timing/statechange output, is what will confirm or refute the
+  render-quantum-race hypothesis.
+- Deployment and the fourth cross-device retest checkpoint are the next
+  steps (see below); notation/UI work remains explicitly not started, per
+  the user's instruction not to begin it until this checkpoint is approved.
